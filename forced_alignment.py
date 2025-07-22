@@ -21,6 +21,7 @@ image = (
         "datasets",
         "librosa",
         "soundfile",
+        "fuzzywuzzy",
     ])
 )
 
@@ -38,14 +39,15 @@ app = modal.App("general-forced-alignment", image=image)
 )
 
 class ForcedAligner:
-    @modal.method()
-    def load_model(self, model_name="facebook/wav2vec2-base-960h"):
+    @modal.enter()
+    def setup(self):
         import torch
         from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
+        model_name = "facebook/wav2vec2-base-960h"
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.processor = Wav2Vec2Processor.from_pretrained(model_name)
-        self.model = Wav2Vec2ForCTC.from_pretrained(model_name).to(self.device)
+        self.processor = Wav2Vec2Processor.from_pretrained(model_name, cache_dir=CACHE_DIR)
+        self.model = Wav2Vec2ForCTC.from_pretrained(model_name, cache_dir=CACHE_DIR).to(self.device)
         self.labels = self.processor.tokenizer.convert_ids_to_tokens(list(range(self.model.lm_head.out_features)))
         self.label_dict = {c: i for i, c in enumerate(self.labels)}
 
@@ -73,6 +75,7 @@ class ForcedAligner:
         import torch
         import uroman as ur
         from dataclasses import dataclass
+        from fuzzywuzzy import fuzz
         
         @dataclass
         class Point:
@@ -223,13 +226,7 @@ class ForcedAligner:
         elif isinstance(audio_files, str):
             raise ValueError("audio_files must be a list of dicts, not a string")
         
-        print(type(audio_files))
-        print("First element of audio_files: " + str(audio_files[0]))
-
-        #print(audio_files)
         for i in range(len(audio_files)):
-            print("Audio files in loop: " + str(audio_files[i]))
-            print("Type of audio_files[i]: " + str(type(audio_files[i])))
 
             try:
                 s3_path = audio_files[i]['s3_path']
@@ -257,6 +254,9 @@ class ForcedAligner:
                 # Filter unwanted characters
                 text_block = ''.join(c for c in chunk_text if c.isalpha() or c == '|')
                 text_block = text_block.replace('ʼ', '')
+                if not text_block.strip():
+                    print(f"[WARNING] Empty or invalid text_block for file: {filename}")
+                    continue
 
                 s3 = boto3.client("s3")
                 audio_obj = s3.get_object(Bucket=bucket, Key=key)
@@ -290,6 +290,7 @@ class ForcedAligner:
                     
                     # Use the corresponding ASR segment
                     asr_transcription = asr_segments[i].lower() if i < len(asr_segments) else ""
+                    match_score = fuzz.ratio(text_lines[i], asr_transcription)
                     
                     # Append record as dictionary
                     output_records.append({
@@ -298,7 +299,8 @@ class ForcedAligner:
                         'source_file': filename,
                         'start': x0_seconds,
                         'end': x1_seconds,
-                        'asr_transcription': asr_transcription
+                        'asr_transcription': asr_transcription,
+                        'match_score': match_score
                     })
                     
                 if 'emissions' in locals():
