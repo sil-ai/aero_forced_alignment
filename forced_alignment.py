@@ -31,876 +31,570 @@ s3_access_credentials = modal.Secret.from_name("my-aws-secret")
 app = modal.App("general-forced-alignment", image=image)
 
 
-@app.cls(
-    network_file_systems={CACHE_DIR: volume},
-    gpu="t4",
-    secrets=[modal.Secret.from_name("my-huggingface-secret"), s3_access_credentials],
-    timeout=36000,
+@app.function(
+    secrets=[modal.Secret.from_name("my-huggingface-secret")],
+    timeout=1200,
 )
-class ForcedAligner:
-    # @modal.enter()
-    # def setup(self):
-        # import torch
-        # from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
-
-        # model_name = "facebook/wav2vec2-base-960h"
-        # self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        # self.processor = Wav2Vec2Processor.from_pretrained(model_name, cache_dir=CACHE_DIR)
-        # self.model = Wav2Vec2ForCTC.from_pretrained(model_name, cache_dir=CACHE_DIR).to(self.device)
-        # self.labels = self.processor.tokenizer.convert_ids_to_tokens(list(range(self.model.lm_head.out_features)))
-        # self.label_dict = {c: i for i, c in enumerate(self.labels)}
-
-    # def _get_dataclasses(self):
-    #     """Get the shared dataclasses for alignment."""
-        
-        
-    #     return Point, Segment
-
-    def _audiosegment_to_waveform(self, audio_segment):
-        """Convert AudioSegment to waveform tensor."""
-        import numpy as np
-        import torch
-        
-        samples = np.array(audio_segment.get_array_of_samples()).astype(np.float32)
-        if audio_segment.channels == 2:
-            samples = samples.reshape((-1, 2)).T  # shape (channels, samples)
-        else:
-            samples = samples[np.newaxis, :]  # shape (1, samples)
-        samples /= (1 << (8 * audio_segment.sample_width - 1))  # normalize to [-1, 1]
-        return torch.from_numpy(samples), audio_segment.frame_rate
-
-
-    # @modal.method()
-    # def align_from_dataset(self, 
-    #                       dataset_name: str,
-    #                       text_column: str = "text",
-    #                       audio_column: str = "audio",
-    #                     id_column: str = None,
-    #                       max_words: int = 100,
-    #                       romanize: bool = False,
-    #                       split: Optional[str] = None,
-    #                       limit: int = None,
-    #                       output_dataset_name: Optional[str] = None,
-    #                       ) -> List[Dict[str, str]]:
-    #     """
-    #     Perform forced alignment on audio and text from a Hugging Face dataset.
-    #     Splits text into chunks based on sentences with max word limits.
-        
-    #     Args:
-    #         dataset_name: Name of the HF dataset (e.g., "mozilla-foundation/common_voice_11_0")
-    #         max_words: Maximum number of words per text chunk
-    #         split: Dataset split to use (e.g., "train", "test", "validation"). If None, processes all splits.
-    #         audio_column: Name of the audio column in the dataset
-    #         text_column: Name of the text column in the dataset
-    #         id_column: Name of the ID column (optional, will use index if None)
-    #         romanize: Whether to romanize the text
-    #         limit: Maximum number of samples to process per split (None for all)
-        
-    #     Returns:
-    #         List of dictionaries with alignment results for each chunk
-    #     """
-    #     import os
-    #     import gc
-    #     import torch
-    #     import uroman as ur
-    #     from fuzzywuzzy import fuzz
-    #     from datasets import load_dataset
-
-    #     output_records = []
-
-    #     # Determine which splits to process
-    #     if split is None:
-    #         # Load dataset info to get available splits
-    #         print(f"Loading dataset info for: {dataset_name}")
-    #         dataset_info = load_dataset(dataset_name, streaming=False)
-    #         splits_to_process = list(dataset_info.keys())
-    #         print(f"Found splits: {splits_to_process}")
-    #     else:
-    #         splits_to_process = [split]
-
-    #     # Process each split
-    #     for current_split in splits_to_process:
-    #         print(f"Processing split: {current_split}")
-            
-    #         try:
-    #             # Load dataset for current split
-    #             dataset = load_dataset(dataset_name, split=current_split, streaming=False)
-                
-    #             if limit:
-    #                 dataset = dataset.select(range(min(limit, len(dataset))))
-                
-    #             print(f"Loaded {len(dataset)} samples from split '{current_split}'")
-                
-    #             for idx, sample in enumerate(dataset):
-    #                 try:
-    #                     # Extract audio and text
-    #                     audio_data = sample[audio_column]
-    #                     text = sample[text_column]
-                        
-    #                     # Get sample ID
-    #                     if id_column and id_column in sample:
-    #                         sample_id = str(sample[id_column])
-    #                     else:
-    #                         sample_id = f"{current_split}_sample_{idx}"
-                        
-    #                     # Split text into chunks
-    #                     text_chunks = split_text_into_chunks(text, max_words)
-                        
-    #                     if not text_chunks:
-    #                         print(f"[WARNING] No valid text chunks for sample: {sample_id}")
-    #                         continue
-                        
-    #                     # Process audio
-    #                     audio_array = audio_data["array"]
-    #                     sample_rate = audio_data["sampling_rate"]
-    #                     waveform, sr = audioarray_to_waveform(audio_array, sample_rate)
-                        
-    #                     # Create combined text for alignment (like align_from_s3)
-    #                     chunk_text = '|' + '|'.join(text_chunks).upper() + '|'
-                        
-    #                     if romanize:
-    #                         uroman = ur.Uroman()
-    #                         chunk_text = uroman.romanize_string(chunk_text)
-    #                         print("Romanized")
-    #                     else:
-    #                         print("Not Romanized")
-                        
-    #                     # Filter unwanted characters
-    #                     text_block = ''.join(c for c in chunk_text if c.isalpha() or c == '|')
-    #                     text_block = text_block.replace('ʼ', '')
-                        
-    #                     if not text_block.strip():
-    #                         print(f"[WARNING] Empty or invalid text_block for sample: {sample_id}")
-    #                         continue
-                        
-    #                     # Perform alignment
-    #                     break_segs, trellis, emissions = process_audio_and_align.remote(waveform, text_block)
-    #                     ratio = waveform.size(1) / trellis.size(0)
-                        
-    #                     # Extract ASR segments
-    #                     asr_segments = extract_asr_segments(emissions, break_segs, ratio)
-                        
-    #                     # Create output records for each chunk
-    #                     for i in range(len(break_segs) - 1):
-    #                         if i < len(text_chunks):
-    #                             chunk_id = f"{sample_id}_chunk_{i}"
-    #                             x0_frames = int(ratio * break_segs[i].end)
-    #                             if i + 1 < len(break_segs):
-    #                                 x1_frames = int(ratio * break_segs[i + 1].start)
-    #                             else:
-    #                                 x1_frames = waveform.size(1)
-                                
-    #                             x0_seconds = round(x0_frames / sr, 3)
-    #                             x1_seconds = round(x1_frames / sr, 3)
-                                
-    #                             # Use the corresponding ASR segment
-    #                             asr_transcription = asr_segments[i].lower() if i < len(asr_segments) else ""
-    #                             match_score = fuzz.ratio(text_chunks[i].lower(), asr_transcription)
-                                
-    #                             # Append record
-    #                             output_records.append({
-    #                                 'chunk_id': chunk_id,
-    #                                 'text': text_chunks[i],
-    #                                 'source_sample_id': sample_id,
-    #                                 'chunk_index': i,
-    #                                 'start': x0_seconds,
-    #                                 'end': x1_seconds,
-    #                                 'duration': round(x1_seconds - x0_seconds, 3),
-    #                                 'word_count': len(text_chunks[i].split()),
-    #                                 'asr_transcription': asr_transcription,
-    #                                 'match_score': match_score,
-    #                                 'dataset_name': dataset_name,
-    #                                 'split': current_split
-    #                             })
-                        
-    #                     print(f"Processed {current_split} sample {idx}: {sample_id}, created {len(text_chunks)} chunks")
-                        
-    #                     # Clean up
-    #                     if 'emissions' in locals():
-    #                         del emissions
-    #                     if 'segments' in locals():
-    #                         del segments
-    #                     if 'trellis' in locals():
-    #                         del trellis
-    #                     if 'path' in locals():
-    #                         del path
-    #                     if 'asr_segments' in locals():
-    #                         del asr_segments
-    #                     gc.collect()
-    #                     torch.cuda.empty_cache()
-                        
-    #                 except torch.cuda.OutOfMemoryError as e:
-    #                     print(f"Skipping {current_split} sample {idx} ({sample_id}) due to OOM: {e}")
-    #                     gc.collect()
-    #                     torch.cuda.empty_cache()
-    #                     continue
-    #                 except Exception as e:
-    #                     print(f"Error processing {current_split} sample {idx} ({sample_id}): {e}")
-    #                     continue
-
-    #             print(f"Completed processing split '{current_split}': {len([r for r in output_records if r['split'] == current_split])} chunks created")
-                        
-    #         except Exception as e:
-    #             print(f"Error loading or processing split '{current_split}': {e}")
-    #             continue
-
-    #     print(f"Total chunks created across all splits: {len(output_records)}")
-
-    #     self.push_to_hf_dataset(output_records, output_dataset_name, token=os.getenv("HF_TOKEN"))
-    #     return output_records
+def push_to_hf_dataset(output_records: List[Dict[str, str]], 
+                    output_dataset_name: Optional[str] = None, 
+                    token: Optional[str] = None,
+                    include_audio: bool = True,
+                    original_audio_data: Optional[Dict[str, any]] = None) -> str:
+    """
+    Push the alignment results to a Hugging Face dataset, preserving original splits.
     
-
-    def push_to_hf_dataset(self, output_records: List[Dict[str, str]], 
-                        output_dataset_name: Optional[str] = None, 
-                        token: Optional[str] = None,
-                        include_audio: bool = True,
-                        original_audio_data: Optional[Dict[str, any]] = None) -> str:
-        """
-        Push the alignment results to a Hugging Face dataset, preserving original splits.
+    Args:
+        output_records: List of dictionaries with alignment results
+        output_dataset_name: Name of the dataset to create or update
+        include_audio: Whether to include audio segments in the dataset
+        original_audio_data: Dictionary mapping source file identifiers to audio data
+                            Format: {source_id: {"waveform": tensor, "sample_rate": int}}
         
-        Args:
-            output_records: List of dictionaries with alignment results
-            output_dataset_name: Name of the dataset to create or update
-            include_audio: Whether to include audio segments in the dataset
-            original_audio_data: Dictionary mapping source file identifiers to audio data
-                                Format: {source_id: {"waveform": tensor, "sample_rate": int}}
+    Returns:
+        The name of the created or updated dataset
+    """
+    import os
+    import numpy as np
+    from datasets import Dataset, DatasetDict, Features, Value, Audio
+    import torch
+    
+    if not output_records:
+        raise ValueError("No records to push to dataset")
+    
+    print(f"Processing {len(output_records)} records for dataset creation")
+    
+    # Group records by split
+    split_records = {}
+    for record in output_records:
+        split_name = record.get('split', 'train')  # Default to 'train' if no split specified
+        if split_name not in split_records:
+            split_records[split_name] = []
+        split_records[split_name].append(record)
+    
+    print(f"Found splits: {list(split_records.keys())}")
+    for split_name, records in split_records.items():
+        print(f"  {split_name}: {len(records)} records")
+    
+    # Process each split separately
+    datasets_by_split = {}
+    
+    for split_name, records in split_records.items():
+        print(f"Processing split: {split_name}")
+        
+        # Create a copy of records to avoid modifying the original
+        processed_records = []
+        
+        for i, record in enumerate(records):
+            # Create a copy of each record
+            new_record = record.copy()
             
-        Returns:
-            The name of the created or updated dataset
-        """
-        import os
-        import numpy as np
-        from datasets import Dataset, DatasetDict, Features, Value, Audio
-        import torch
-        
-        if not output_records:
-            raise ValueError("No records to push to dataset")
-        
-        print(f"Processing {len(output_records)} records for dataset creation")
-        
-        # Group records by split
-        split_records = {}
-        for record in output_records:
-            split_name = record.get('split', 'train')  # Default to 'train' if no split specified
-            if split_name not in split_records:
-                split_records[split_name] = []
-            split_records[split_name].append(record)
-        
-        print(f"Found splits: {list(split_records.keys())}")
-        for split_name, records in split_records.items():
-            print(f"  {split_name}: {len(records)} records")
-        
-        # Process each split separately
-        datasets_by_split = {}
-        
-        for split_name, records in split_records.items():
-            print(f"Processing split: {split_name}")
-            
-            # Create a copy of records to avoid modifying the original
-            processed_records = []
-            
-            for i, record in enumerate(records):
-                # Create a copy of each record
-                new_record = record.copy()
+            # If including audio, extract segments for each record
+            if include_audio and original_audio_data:
+                source_id = record.get('source_sample_id') or record.get('source_file')
                 
-                # If including audio, extract segments for each record
-                if include_audio and original_audio_data:
-                    source_id = record.get('source_sample_id') or record.get('source_file')
-                    
-                    if source_id and source_id in original_audio_data:
-                        try:
-                            audio_info = original_audio_data[source_id]
-                            waveform = audio_info['waveform']
-                            sample_rate = audio_info['sample_rate']
-                            
-                            # Extract audio segment based on start/end times
-                            start_sample = int(record['start'] * sample_rate)
-                            end_sample = int(record['end'] * sample_rate)
-                            
-                            # Ensure we don't go out of bounds
-                            if isinstance(waveform, torch.Tensor):
-                                if waveform.dim() > 1:
-                                    audio_segment = waveform[:, start_sample:end_sample]
-                                    # Convert to mono if needed
-                                    if audio_segment.shape[0] > 1:
-                                        audio_segment = audio_segment.mean(dim=0)
-                                    else:
-                                        audio_segment = audio_segment.squeeze(0)
+                if source_id and source_id in original_audio_data:
+                    try:
+                        audio_info = original_audio_data[source_id]
+                        waveform = audio_info['waveform']
+                        sample_rate = audio_info['sample_rate']
+                        
+                        # Extract audio segment based on start/end times
+                        start_sample = int(record['start'] * sample_rate)
+                        end_sample = int(record['end'] * sample_rate)
+                        
+                        # Ensure we don't go out of bounds
+                        if isinstance(waveform, torch.Tensor):
+                            if waveform.dim() > 1:
+                                audio_segment = waveform[:, start_sample:end_sample]
+                                # Convert to mono if needed
+                                if audio_segment.shape[0] > 1:
+                                    audio_segment = audio_segment.mean(dim=0)
                                 else:
-                                    audio_segment = waveform[start_sample:end_sample]
-                                
-                                # Convert to numpy
-                                audio_segment = audio_segment.detach().cpu().numpy()
+                                    audio_segment = audio_segment.squeeze(0)
                             else:
-                                # Handle numpy arrays
-                                if len(waveform.shape) > 1:
-                                    audio_segment = waveform[:, start_sample:end_sample]
-                                    if audio_segment.shape[0] > 1:
-                                        audio_segment = audio_segment.mean(axis=0)
-                                    else:
-                                        audio_segment = audio_segment.squeeze(0)
+                                audio_segment = waveform[start_sample:end_sample]
+                        else:
+                            # Handle numpy arrays
+                            if len(waveform.shape) > 1:
+                                audio_segment = waveform[:, start_sample:end_sample]
+                                if audio_segment.shape[0] > 1:
+                                    audio_segment = audio_segment.mean(axis=0)
                                 else:
-                                    audio_segment = waveform[start_sample:end_sample]
-                            
-                            # Ensure it's a proper 1D numpy array with float32 dtype
-                            audio_segment = np.array(audio_segment, dtype=np.float32)
-                            if audio_segment.ndim > 1:
-                                audio_segment = audio_segment.flatten()
-                            
-                            # Validate the audio segment
-                            if len(audio_segment) == 0:
-                                print(f"Warning: Empty audio segment for record {i} in {split_name}, source: {source_id}")
-                                # Skip adding audio for this record but keep the record
-                                processed_records.append(new_record)
-                                continue
-                                
-                            # Debug: print type and shape info for first few records
-                            if i < 3:
-                                print(f"Record {i} ({split_name}): audio_segment type={type(audio_segment)}, shape={audio_segment.shape}, dtype={audio_segment.dtype}")
-                                print(f"Record {i} ({split_name}): sample_rate={sample_rate}, audio length={len(audio_segment)}")
-                            
-                            # Add audio data to record in the exact format expected by HF
-                            new_record['audio'] = {
-                                'array': audio_segment,
-                                'sampling_rate': int(sample_rate)
-                            }
-                            
-                        except Exception as e:
-                            print(f"Error processing audio for record {i} in {split_name}, source {source_id}: {e}")
-                            # Skip this record's audio but keep the record
+                                    audio_segment = audio_segment.squeeze(0)
+                            else:
+                                audio_segment = waveform[start_sample:end_sample]
+                        
+                        # Ensure it's a proper 1D numpy array with float32 dtype
+                        audio_segment = np.array(audio_segment, dtype=np.float32)
+                        if audio_segment.ndim > 1:
+                            audio_segment = audio_segment.flatten()
+                        
+                        # Validate the audio segment
+                        if len(audio_segment) == 0:
+                            print(f"Warning: Empty audio segment for record {i} in {split_name}, source: {source_id}")
+                            # Skip adding audio for this record but keep the record
                             processed_records.append(new_record)
                             continue
-                    else:
-                        print(f"Warning: No audio data found for source: {source_id}")
-                
-                processed_records.append(new_record)
-            
-            # Filter records that have audio if we're supposed to include audio
-            if include_audio:
-                records_with_audio = [r for r in processed_records if 'audio' in r]
-                print(f"Records with audio in {split_name}: {len(records_with_audio)} out of {len(processed_records)}")
-                
-                if len(records_with_audio) == 0:
-                    print(f"Warning: No records have audio data in {split_name}, creating dataset without audio")
-                    include_audio_for_split = False
-                    dataset_records = processed_records
+                            
+                        # Debug: print type and shape info for first few records
+                        if i < 3:
+                            print(f"Record {i} ({split_name}): audio_segment type={type(audio_segment)}, shape={audio_segment.shape}, dtype={audio_segment.dtype}")
+                            print(f"Record {i} ({split_name}): sample_rate={sample_rate}, audio length={len(audio_segment)}")
+                        
+                        # Add audio data to record in the exact format expected by HF
+                        new_record['audio'] = {
+                            'array': audio_segment,
+                            'sampling_rate': int(sample_rate)
+                        }
+                        
+                    except Exception as e:
+                        print(f"Error processing audio for record {i} in {split_name}, source {source_id}: {e}")
+                        # Skip this record's audio but keep the record
+                        processed_records.append(new_record)
+                        continue
                 else:
-                    include_audio_for_split = True
-                    dataset_records = records_with_audio
-            else:
+                    print(f"Warning: No audio data found for source: {source_id}")
+            
+            processed_records.append(new_record)
+        
+        # Filter records that have audio if we're supposed to include audio
+        if include_audio:
+            records_with_audio = [r for r in processed_records if 'audio' in r]
+            print(f"Records with audio in {split_name}: {len(records_with_audio)} out of {len(processed_records)}")
+            
+            if len(records_with_audio) == 0:
+                print(f"Warning: No records have audio data in {split_name}, creating dataset without audio")
                 include_audio_for_split = False
                 dataset_records = processed_records
-            
-            print(f"Creating dataset for {split_name} from {len(dataset_records)} records")
-            
-            # Define the features schema explicitly
-            if include_audio_for_split:
-                features = Features({
-                    'chunk_id': Value('string'),
-                    'text': Value('string'),
-                    'source_sample_id': Value('string'),
-                    'chunk_index': Value('int64'),
-                    'start': Value('float64'),
-                    'end': Value('float64'),
-                    'duration': Value('float64'),
-                    'word_count': Value('int64'),
-                    'asr_transcription': Value('string'),
-                    'match_score': Value('int64'),
-                    'dataset_name': Value('string'),
-                    'split': Value('string'),
-                    'audio': Audio(sampling_rate=16000)
-                })
             else:
-                features = Features({
-                    'chunk_id': Value('string'),
-                    'text': Value('string'),
-                    'source_sample_id': Value('string'),
-                    'chunk_index': Value('int64'),
-                    'start': Value('float64'),
-                    'end': Value('float64'),
-                    'duration': Value('float64'),
-                    'word_count': Value('int64'),
-                    'asr_transcription': Value('string'),
-                    'match_score': Value('int64'),
-                    'dataset_name': Value('string'),
-                    'split': Value('string')
-                })
+                include_audio_for_split = True
+                dataset_records = records_with_audio
+        else:
+            include_audio_for_split = False
+            dataset_records = processed_records
+        
+        print(f"Creating dataset for {split_name} from {len(dataset_records)} records")
+        
+        # Define the features schema explicitly
+        if include_audio_for_split:
+            features = Features({
+                'chunk_id': Value('string'),
+                'text': Value('string'),
+                'source_sample_id': Value('string'),
+                'chunk_index': Value('int64'),
+                'start': Value('float64'),
+                'end': Value('float64'),
+                'duration': Value('float64'),
+                'word_count': Value('int64'),
+                'asr_transcription': Value('string'),
+                'match_score': Value('int64'),
+                'dataset_name': Value('string'),
+                'split': Value('string'),
+                'audio': Audio(sampling_rate=16000)
+            })
+        else:
+            features = Features({
+                'chunk_id': Value('string'),
+                'text': Value('string'),
+                'source_sample_id': Value('string'),
+                'chunk_index': Value('int64'),
+                'start': Value('float64'),
+                'end': Value('float64'),
+                'duration': Value('float64'),
+                'word_count': Value('int64'),
+                'asr_transcription': Value('string'),
+                'match_score': Value('int64'),
+                'dataset_name': Value('string'),
+                'split': Value('string')
+            })
+        
+        # Create dataset with explicit features
+        try:
+            dataset = Dataset.from_list(dataset_records, features=features)
+            print(f"Dataset for {split_name} created successfully with explicit features")
+        except Exception as e:
+            print(f"Error creating dataset for {split_name} with features: {e}")
             
-            # Create dataset with explicit features
+            # Try to fix the data format
+            print(f"Attempting to fix audio data format for {split_name}...")
+            
+            # Double-check all audio data is properly formatted
+            for i, record in enumerate(dataset_records):
+                if 'audio' in record:
+                    audio_data = record['audio']
+                    if isinstance(audio_data['array'], list):
+                        print(f"Converting list to numpy array for record {i} in {split_name}")
+                        audio_data['array'] = np.array(audio_data['array'], dtype=np.float32)
+                    elif not isinstance(audio_data['array'], np.ndarray):
+                        print(f"Converting {type(audio_data['array'])} to numpy array for record {i} in {split_name}")
+                        audio_data['array'] = np.array(audio_data['array'], dtype=np.float32)
+                    
+                    # Ensure it's 1D
+                    if audio_data['array'].ndim > 1:
+                        audio_data['array'] = audio_data['array'].flatten()
+                    
+                    # Ensure correct dtype
+                    if audio_data['array'].dtype != np.float32:
+                        audio_data['array'] = audio_data['array'].astype(np.float32)
+            
+            # Try again with corrected data
             try:
                 dataset = Dataset.from_list(dataset_records, features=features)
-                print(f"Dataset for {split_name} created successfully with explicit features")
-            except Exception as e:
-                print(f"Error creating dataset for {split_name} with features: {e}")
+                print(f"Dataset for {split_name} created successfully after fixing audio format")
+            except Exception as e2:
+                print(f"Still failing for {split_name} after audio format fix: {e2}")
+                # Final fallback: create dataset without audio and warn user
+                records_without_audio = []
+                for record in dataset_records:
+                    new_record = {k: v for k, v in record.items() if k != 'audio'}
+                    records_without_audio.append(new_record)
                 
-                # Try to fix the data format
-                print(f"Attempting to fix audio data format for {split_name}...")
-                
-                # Double-check all audio data is properly formatted
-                for i, record in enumerate(dataset_records):
-                    if 'audio' in record:
-                        audio_data = record['audio']
-                        if isinstance(audio_data['array'], list):
-                            print(f"Converting list to numpy array for record {i} in {split_name}")
-                            audio_data['array'] = np.array(audio_data['array'], dtype=np.float32)
-                        elif not isinstance(audio_data['array'], np.ndarray):
-                            print(f"Converting {type(audio_data['array'])} to numpy array for record {i} in {split_name}")
-                            audio_data['array'] = np.array(audio_data['array'], dtype=np.float32)
-                        
-                        # Ensure it's 1D
-                        if audio_data['array'].ndim > 1:
-                            audio_data['array'] = audio_data['array'].flatten()
-                        
-                        # Ensure correct dtype
-                        if audio_data['array'].dtype != np.float32:
-                            audio_data['array'] = audio_data['array'].astype(np.float32)
-                
-                # Try again with corrected data
-                try:
-                    dataset = Dataset.from_list(dataset_records, features=features)
-                    print(f"Dataset for {split_name} created successfully after fixing audio format")
-                except Exception as e2:
-                    print(f"Still failing for {split_name} after audio format fix: {e2}")
-                    # Final fallback: create dataset without audio and warn user
-                    records_without_audio = []
-                    for record in dataset_records:
-                        new_record = {k: v for k, v in record.items() if k != 'audio'}
-                        records_without_audio.append(new_record)
-                    
-                    features_no_audio = Features({k: v for k, v in features.items() if k != 'audio'})
-                    dataset = Dataset.from_list(records_without_audio, features=features_no_audio)
-                    print(f"WARNING: Created dataset for {split_name} WITHOUT audio due to formatting issues")
+                features_no_audio = Features({k: v for k, v in features.items() if k != 'audio'})
+                dataset = Dataset.from_list(records_without_audio, features=features_no_audio)
+                print(f"WARNING: Created dataset for {split_name} WITHOUT audio due to formatting issues")
+        
+        datasets_by_split[split_name] = dataset
+    
+    # Create DatasetDict with all splits
+    dataset_dict = DatasetDict(datasets_by_split)
+    
+    # If no name provided, use a default name
+    if not output_dataset_name:
+        output_dataset_name = "forced_alignment_results"
+    
+    # Save the dataset with splits
+    print(f"Pushing dataset '{output_dataset_name}' with {len(datasets_by_split)} splits to HuggingFace Hub")
+    dataset_dict.push_to_hub(output_dataset_name, token=token, private=True)
+    
+    return output_dataset_name
+
+
+@app.function(
+    secrets=[modal.Secret.from_name("my-huggingface-secret")],
+    timeout=3600,
+)
+def align_from_dataset_parallel(
+                        dataset_name: str,
+                        text_column: str = "text",
+                        audio_column: str = "audio",
+                        id_column: str = None,
+                        max_words: int = 100,
+                        romanize: bool = False,
+                        split: Optional[str] = None,
+                        limit: int = None,
+                        output_dataset_name: Optional[str] = None,
+                        batch_size: int = 100,
+                        ) -> List[Dict[str, str]]:
+    """
+    Perform forced alignment on audio and text from a Hugging Face dataset using parallel processing.
+    
+    Args:
+        dataset_name: Name of the HF dataset
+        batch_size: Number of samples to process in parallel (limited by GPU availability)
+        ... (other args same as original method)
+    
+    Returns:
+        List of dictionaries with alignment results for each chunk
+    """
+    from datasets import load_dataset, Audio
+    import os
+    import torch
+    
+    # Determine which splits to process
+    if split is None:
+        print(f"Loading dataset info for: {dataset_name}")
+        dataset_info = load_dataset(dataset_name, streaming=False)
+        splits_to_process = list(dataset_info.keys())
+        print(f"Found splits: {splits_to_process}")
+    else:
+        splits_to_process = [split]
+
+    all_output_records = []
+    original_audio_data = {}  # Store original audio for each sample
+
+    # Process each split
+    for current_split in splits_to_process:
+        print(f"Processing split: {current_split}")
+        # Load dataset for current split
+        dataset = load_dataset(dataset_name, split=current_split, streaming=False)
+        
+        if limit:
+            dataset = dataset.select(range(min(limit, len(dataset))))
+        
+        print(f"Loaded {len(dataset)} samples from split '{current_split}'")
+
+        texts = dataset[text_column]
+        ids   = dataset[id_column] if id_column else [None]*len(dataset)
+
+        dataset = dataset.cast_column(audio_column, Audio(decode=True))
+        dataset = dataset.with_format("numpy", columns=[audio_column])
+
+        sample_dicts = []
+        for idx, ex in enumerate(dataset):
+            sample_id = ids[idx] if ids[idx] is not None else f"{current_split}_sample_{idx}"
             
-            datasets_by_split[split_name] = dataset
-        
-        # Create DatasetDict with all splits
-        dataset_dict = DatasetDict(datasets_by_split)
-        
-        # If no name provided, use a default name
-        if not output_dataset_name:
-            output_dataset_name = "forced_alignment_results"
-        
-        # Save the dataset with splits
-        print(f"Pushing dataset '{output_dataset_name}' with {len(datasets_by_split)} splits to HuggingFace Hub")
-        dataset_dict.push_to_hub(output_dataset_name, token=token, private=True)
-        
-        return output_dataset_name
-
-    @modal.method()
-    def align_from_s3(self, 
-                      audio_files: List[Dict[str, Union[str, bytes, List[Dict[str, str]]]]],
-                      romanize: bool = False) -> Dict[str, str]:
-        """
-        
-        Args:
-            audio_files:[{
-                "filename": ..., 
-                "s3_path": ..., 
-                "ref_text": [{"key": "...", "text": "..."}, ...]
-        }]
-            romanize: Whether to romanize the text
-        
-        Returns:
-            Dictionary with timestamps for splitting source audio
-        """
-        import os
-        import torch
-        import uroman as ur
-        import boto3
-        from fuzzywuzzy import fuzz
-        from pydub import AudioSegment
-        import io
-
-        output_records = []
-
-        if isinstance(audio_files, dict):
-            audio_files = [audio_files]
-        elif isinstance(audio_files, str):
-            raise ValueError("audio_files must be a list of dicts, not a string")
-        
-        for i in range(len(audio_files)):
-
-            try:
-                s3_path = audio_files[i]['s3_path']
-                bucket, key = s3_path.replace("s3://", "").split("/", 1)
-                if 'filename' in audio_files[i]:
-                    filename = audio_files[i]['filename']
-                else:
-                    filename = key.split('/')[-1].split('.')[0]
-                ref_text = audio_files[i]['ref_text']  # List of dicts with 'key' and 'text'
-
-                text_lines = [v['text'] for v in ref_text]
-                if 'key' in ref_text[0]:
-                    text_refs = [v['key'] for v in ref_text]
-                else:
-                    text_refs = [filename + '_' + str(i) for i in range(len(text_lines))]
-                chunk_text = '|' + '|'.join(text_lines).upper() + '|'
-
-                if romanize:
-                    uroman = ur.Uroman()
-                    chunk_text = uroman.romanize_string(chunk_text)
-                    print("Romanized")
-                else:
-                    print("Not Romanized")
-
-                # Filter unwanted characters
-                text_block = ''.join(c for c in chunk_text if c.isalpha() or c == '|')
-                text_block = text_block.replace('ʼ', '')
-                if not text_block.strip():
-                    print(f"[WARNING] Empty or invalid text_block for file: {filename}")
-                    continue
-
-                s3 = boto3.client("s3")
-                audio_obj = s3.get_object(Bucket=bucket, Key=key)
-                ext = os.path.splitext(s3_path)[-1].lower().lstrip('.')
-                section_audio = AudioSegment.from_file(io.BytesIO(audio_obj['Body'].read()), format=ext)
-
-                waveform, sr = self._audiosegment_to_waveform(section_audio)
-                if sr != 16000:
-                    section_audio = section_audio.set_frame_rate(16000)
-                    section_audio = section_audio.set_channels(1)
-                    waveform, sr = self._audiosegment_to_waveform(section_audio)
-                    sr = 16000
-                break_segs, trellis, emissions = process_audio_and_align.remote(waveform, text_block)
-                ratio = waveform.size(1) / trellis.size(0)
-                
-                # Extract ASR segments
-                asr_segments = extract_asr_segments(emissions, break_segs, ratio)
-                
-                for i in range(len(break_segs)-1):
-                    output_filename = text_refs[i].replace(
-                        ' ', '_').replace(':', '_').replace('\n', '')
-                    output_key = f'output/{output_filename}.wav'
-                    x0_frames = int(ratio * break_segs[i].end)
-                    if i + 1 < len(break_segs):
-                        x1_frames = int(ratio * break_segs[i+1].start)
-                    else:
-                        x1_frames = waveform.size(1)
-                    x0_seconds = round(x0_frames / sr, 3)
-                    x1_seconds = round(x1_frames / sr, 3)
-                    
-                    # Use the corresponding ASR segment
-                    asr_transcription = asr_segments[i].lower() if i < len(asr_segments) else ""
-                    match_score = fuzz.ratio(text_lines[i], asr_transcription)
-                    
-                    # Append record as dictionary
-                    output_records.append({
-                        'filename': output_key,
-                        'text': text_lines[i],
-                        'source_file': filename,
-                        'start': x0_seconds,
-                        'end': x1_seconds,
-                        'asr_transcription': asr_transcription,
-                        'match_score': match_score
-                    })
-
-            except torch.cuda.OutOfMemoryError as e:
-                print(f"Skipping {filename} due to OOM: {e}")
-
-        return output_records
-
-
-    @modal.method()
-    def process_single_s3_file(self, file_data: Dict[str, Union[str, List[Dict[str, str]]]], romanize: bool = False) -> List[Dict[str, str]]:
-        """
-        Process a single S3 audio file for forced alignment.
-        This method is designed to be called in parallel via .map()
-        """
-        import gc
-        import numpy as np
-        import os
-        import re
-        import torch
-        import uroman as ur
-        import boto3
-        from fuzzywuzzy import fuzz
-        from pydub import AudioSegment
-        import io
-        
-        output_records = []
-        
-        try:
-            s3_path = file_data['s3_path']
-            bucket, key = s3_path.replace("s3://", "").split("/", 1)
-            if 'filename' in file_data:
-                filename = file_data['filename']
-            else:
-                filename = key.split('/')[-1].split('.')[0]
-            ref_text = file_data['ref_text']  # List of dicts with 'key' and 'text'
-
-            text_lines = [v['text'] for v in ref_text]
-            if 'key' in ref_text[0]:
-                text_refs = [v['key'] for v in ref_text]
-            else:
-                text_refs = [filename + '_' + str(i) for i in range(len(text_lines))]
-            chunk_text = '|' + '|'.join(text_lines).upper() + '|'
-
-            if romanize:
-                uroman = ur.Uroman()
-                chunk_text = uroman.romanize_string(chunk_text)
-                print("Romanized")
-            else:
-                print("Not Romanized")
-
-            # Filter unwanted characters
-            text_block = ''.join(c for c in chunk_text if c.isalpha() or c == '|')
-            text_block = text_block.replace('ʼ', '')
-            if not text_block.strip():
-                print(f"[WARNING] Empty or invalid text_block for file: {filename}")
-                return output_records
-
-            s3 = boto3.client("s3")
-            audio_obj = s3.get_object(Bucket=bucket, Key=key)
-            ext = os.path.splitext(s3_path)[-1].lower().lstrip('.')
-            section_audio = AudioSegment.from_file(io.BytesIO(audio_obj['Body'].read()), format=ext)
-
-            waveform, sr = self._audiosegment_to_waveform(section_audio)
-            if sr != 16000:
-                section_audio = section_audio.set_frame_rate(16000)
-                section_audio = section_audio.set_channels(1)
-                waveform, sr = self._audiosegment_to_waveform(section_audio)
-                sr = 16000
-                
-            break_segs, trellis, emissions = process_audio_and_align.remote(waveform, text_block)
-            ratio = waveform.size(1) / trellis.size(0)
+            # Store original audio data for later use
+            audio_array = ex[audio_column]["array"]
+            sample_rate = ex[audio_column]["sampling_rate"]
+            waveform, sr = audioarray_to_waveform(audio_array, sample_rate)
             
-            # Extract ASR segments
-            asr_segments = extract_asr_segments(emissions, break_segs, ratio)
+            original_audio_data[sample_id] = {
+                'waveform': waveform,
+                'sample_rate': sr
+            }
             
-            for i in range(len(break_segs)-1):
-                output_filename = text_refs[i].replace(
-                    ' ', '_').replace(':', '_').replace('\n', '')
-                output_key = f'output/{output_filename}.wav'
-                x0_frames = int(ratio * break_segs[i].end)
-                if i + 1 < len(break_segs):
-                    x1_frames = int(ratio * break_segs[i+1].start)
-                else:
-                    x1_frames = waveform.size(1)
-                x0_seconds = round(x0_frames / sr, 3)
-                x1_seconds = round(x1_frames / sr, 3)
-                
-                # Use the corresponding ASR segment
-                asr_transcription = asr_segments[i].lower() if i < len(asr_segments) else ""
-                match_score = fuzz.ratio(text_lines[i], asr_transcription)
-                
-                # Append record as dictionary
-                output_records.append({
-                    'filename': output_key,
-                    'text': text_lines[i],
-                    'source_file': filename,
-                    'start': x0_seconds,
-                    'end': x1_seconds,
-                    'asr_transcription': asr_transcription,
-                    'match_score': match_score
-                })
-                
-            print(f"Processed file: {filename}, created {len(output_records)} segments")
-                
-        except torch.cuda.OutOfMemoryError as e:
-            print(f"Skipping {filename} due to OOM: {e}")
-        except Exception as e:
-            print(f"Error processing {filename}: {e}")
-        finally:
-            # Clean up GPU memory
-            gc.collect()
-            torch.cuda.empty_cache()
+            sample_dicts.append({
+                "waveform": audio_array,
+                "sr": sample_rate,
+                "text": texts[idx],
+                "id": sample_id,
+                "idx": idx,
+            })
 
-        return output_records
+        # Process samples in parallel batches
+        for i in range(0, len(sample_dicts), batch_size):
+            batch = sample_dicts[i:i+batch_size]
 
-    @modal.method()
-    def align_from_dataset_parallel(self, 
-                          dataset_name: str,
-                          text_column: str = "text",
-                          audio_column: str = "audio",
-                          id_column: str = None,
-                          max_words: int = 100,
-                          romanize: bool = False,
-                          split: Optional[str] = None,
-                          limit: int = None,
-                          output_dataset_name: Optional[str] = None,
-                          batch_size: int = 100,
-                          ) -> List[Dict[str, str]]:
-        """
-        Perform forced alignment on audio and text from a Hugging Face dataset using parallel processing.
-        
-        Args:
-            dataset_name: Name of the HF dataset
-            batch_size: Number of samples to process in parallel (limited by GPU availability)
-            ... (other args same as original method)
-        
-        Returns:
-            List of dictionaries with alignment results for each chunk
-        """
-        from datasets import load_dataset, Audio
-        import os
-        import torch
-        
-        # Determine which splits to process
-        if split is None:
-            print(f"Loading dataset info for: {dataset_name}")
-            dataset_info = load_dataset(dataset_name, streaming=False)
-            splits_to_process = list(dataset_info.keys())
-            print(f"Found splits: {splits_to_process}")
-        else:
-            splits_to_process = [split]
-
-        all_output_records = []
-        original_audio_data = {}  # Store original audio for each sample
-
-        # Process each split
-        for current_split in splits_to_process:
-            print(f"Processing split: {current_split}")
-            # Load dataset for current split
-            dataset = load_dataset(dataset_name, split=current_split, streaming=False)
-            
-            if limit:
-                dataset = dataset.select(range(min(limit, len(dataset))))
-            
-            print(f"Loaded {len(dataset)} samples from split '{current_split}'")
-
-            texts = dataset[text_column]
-            ids   = dataset[id_column] if id_column else [None]*len(dataset)
-
-            dataset = dataset.cast_column(audio_column, Audio(decode=True))
-            dataset = dataset.with_format("numpy", columns=[audio_column])
-
-            sample_dicts = []
-            for idx, ex in enumerate(dataset):
-                sample_id = ids[idx] if ids[idx] is not None else f"{current_split}_sample_{idx}"
-                
-                # Store original audio data for later use
-                audio_array = ex[audio_column]["array"]
-                sample_rate = ex[audio_column]["sampling_rate"]
-                waveform, sr = audioarray_to_waveform(audio_array, sample_rate)
-                
-                original_audio_data[sample_id] = {
-                    'waveform': waveform,
-                    'sample_rate': sr
-                }
-                
-                sample_dicts.append({
-                    "waveform": audio_array,
-                    "sr": sample_rate,
-                    "text": texts[idx],
-                    "id": sample_id,
-                    "idx": idx,
-                })
-
-            # Process samples in parallel batches
-            for i in range(0, len(sample_dicts), batch_size):
-                batch = sample_dicts[i:i+batch_size]
-
-                print(f"Processing batch {i//batch_size + 1}/{(len(dataset) + batch_size - 1)//batch_size} ({len(batch)} samples)")
-                batch_results = list(process_single_dataset_sample.map(
-                    batch,
-                    range(i, i + batch_size),
-                    [dataset_name] * len(batch),
-                    [current_split] * len(batch), 
-                    [text_column] * len(batch),
-                    [audio_column] * len(batch),
-                    [id_column] * len(batch),
-                    [max_words] * len(batch),
-                    [romanize] * len(batch)
-                ))
-                
-                # Flatten results from batch
-                for result in batch_results:
-                    all_output_records.extend(result)
-                
-                print(f"Completed batch, total chunks so far: {len(all_output_records)}")
-
-        print(f"Total chunks created across all splits: {len(all_output_records)}")
-
-        if output_dataset_name:
-            self.push_to_hf_dataset(all_output_records, output_dataset_name, 
-                                  token=os.getenv("HF_TOKEN"), 
-                                  original_audio_data=original_audio_data)
-            
-        return all_output_records
-
-    @modal.method()
-    def align_from_s3_parallel(self, 
-                      audio_files: List[Dict[str, Union[str, bytes, List[Dict[str, str]]]]],
-                      romanize: bool = False,
-                      batch_size: int = 10,
-                      output_dataset_name: Optional[str] = None) -> List[Dict[str, str]]:
-        """
-        Perform forced alignment on S3 audio files using parallel processing.
-        
-        Args:
-            audio_files: List of file specifications
-            romanize: Whether to romanize the text
-            batch_size: Number of files to process in parallel (limited by GPU availability)
-            output_dataset_name: Name of the dataset to create or update
-        
-        Returns:
-            List of dictionaries with alignment results
-        """
-        import os
-        
-        if isinstance(audio_files, dict):
-            audio_files = [audio_files]
-        elif isinstance(audio_files, str):
-            raise ValueError("audio_files must be a list of dicts, not a string")
-        
-        all_output_records = []
-        original_audio_data = {}  # Store original audio for each file
-        
-        # Process files in parallel batches
-        for i in range(0, len(audio_files), batch_size):
-            batch = audio_files[i:i + batch_size]
-            print(f"Processing batch {i//batch_size + 1}/{(len(audio_files) + batch_size - 1)//batch_size} ({len(batch)} files)")
-            
-            # Use Modal's .map() to process batch in parallel
-            batch_results = list(self.process_single_s3_file.map([
-                (file_data, romanize) for file_data in batch
-            ]))
-            
-            # Collect original audio data for each file in the batch
-            for j, file_data in enumerate(batch):
-                filename = file_data.get('filename', file_data['s3_path'].split('/')[-1].split('.')[0])
-                # Load the original audio for this file
-                try:
-                    s3_path = file_data['s3_path']
-                    bucket, key = s3_path.replace("s3://", "").split("/", 1)
-                    
-                    import boto3
-                    import io
-                    from pydub import AudioSegment
-                    
-                    s3 = boto3.client("s3")
-                    audio_obj = s3.get_object(Bucket=bucket, Key=key)
-                    ext = os.path.splitext(s3_path)[-1].lower().lstrip('.')
-                    section_audio = AudioSegment.from_file(io.BytesIO(audio_obj['Body'].read()), format=ext)
-                    
-                    waveform, sr = self._audiosegment_to_waveform(section_audio)
-                    if sr != 16000:
-                        section_audio = section_audio.set_frame_rate(16000)
-                        section_audio = section_audio.set_channels(1)
-                        waveform, sr = self._audiosegment_to_waveform(section_audio)
-                        sr = 16000
-                    
-                    original_audio_data[filename] = {
-                        'waveform': waveform,
-                        'sample_rate': sr
-                    }
-                except Exception as e:
-                    print(f"Warning: Could not load original audio for {filename}: {e}")
+            print(f"Processing batch {i//batch_size + 1}/{(len(dataset) + batch_size - 1)//batch_size} ({len(batch)} samples)")
+            batch_results = list(process_single_dataset_sample.map(
+                batch,
+                range(i, i + batch_size),
+                [dataset_name] * len(batch),
+                [current_split] * len(batch), 
+                [text_column] * len(batch),
+                [audio_column] * len(batch),
+                [id_column] * len(batch),
+                [max_words] * len(batch),
+                [romanize] * len(batch)
+            ))
             
             # Flatten results from batch
             for result in batch_results:
                 all_output_records.extend(result)
             
-            print(f"Completed batch, total segments so far: {len(all_output_records)}")
+            print(f"Completed batch, total chunks so far: {len(all_output_records)}")
 
-        print(f"Total segments created: {len(all_output_records)}")
+    print(f"Total chunks created across all splits: {len(all_output_records)}")
+
+    if output_dataset_name:
+        push_to_hf_dataset.remote(all_output_records, output_dataset_name, 
+                                token=os.getenv("HF_TOKEN"), 
+                                original_audio_data=original_audio_data)
         
-        if output_dataset_name:
-            self.push_to_hf_dataset(all_output_records, output_dataset_name, 
-                                  token=os.getenv("HF_TOKEN"), 
-                                  original_audio_data=original_audio_data)
+    return all_output_records
+
+@app.function(
+    timeout=3600,
+)
+def align_from_s3_parallel(
+                    audio_files: List[Dict[str, Union[str, bytes, List[Dict[str, str]]]]],
+                    romanize: bool = False,
+                    batch_size: int = 10,
+                    output_dataset_name: Optional[str] = None) -> List[Dict[str, str]]:
+    """
+    Perform forced alignment on S3 audio files using parallel processing.
+    
+    Args:
+        audio_files: List of file specifications
+        romanize: Whether to romanize the text
+        batch_size: Number of files to process in parallel (limited by GPU availability)
+        output_dataset_name: Name of the dataset to create or update
+    
+    Returns:
+        List of dictionaries with alignment results
+    """
+    import os
+    
+    if isinstance(audio_files, dict):
+        audio_files = [audio_files]
+    elif isinstance(audio_files, str):
+        raise ValueError("audio_files must be a list of dicts, not a string")
+    
+    all_output_records = []
+    original_audio_data = {}  # Store original audio for each file
+    
+    # Process files in parallel batches
+    for i in range(0, len(audio_files), batch_size):
+        batch = audio_files[i:i + batch_size]
+        print(f"Processing batch {i//batch_size + 1}/{(len(audio_files) + batch_size - 1)//batch_size} ({len(batch)} files)")
         
-        return all_output_records
+        # Use Modal's .map() to process batch in parallel
+        batch_results = list(process_single_s3_file.map(
+            batch,
+            [romanize] * len(batch)
+        ))
+        
+        
+        # Collect original audio data for each file in the batch
+        for j, file_data in enumerate(batch):
+            filename = file_data.get('filename', file_data['s3_path'].split('/')[-1].split('.')[0])
+            # Load the original audio for this file
+            try:
+                s3_path = file_data['s3_path']
+                bucket, key = s3_path.replace("s3://", "").split("/", 1)
+                
+                import boto3
+                import io
+                from pydub import AudioSegment
+                
+                s3 = boto3.client("s3")
+                audio_obj = s3.get_object(Bucket=bucket, Key=key)
+                ext = os.path.splitext(s3_path)[-1].lower().lstrip('.')
+                section_audio = AudioSegment.from_file(io.BytesIO(audio_obj['Body'].read()), format=ext)
+                
+                waveform, sr = audiosegment_to_waveform(section_audio)
+                if sr != 16000:
+                    section_audio = section_audio.set_frame_rate(16000)
+                    section_audio = section_audio.set_channels(1)
+                    waveform, sr = audiosegment_to_waveform(section_audio)
+                    sr = 16000
+                
+                original_audio_data[filename] = {
+                    'waveform': waveform,
+                    'sample_rate': sr
+                }
+            except Exception as e:
+                print(f"Warning: Could not load original audio for {filename}: {e}")
+        
+        # Flatten results from batch
+        for result in batch_results:
+            all_output_records.extend(result)
+        
+        print(f"Completed batch, total segments so far: {len(all_output_records)}")
+
+    print(f"Total segments created: {len(all_output_records)}")
+    
+    if output_dataset_name:
+        push_to_hf_dataset.remote(all_output_records, output_dataset_name, 
+                                token=os.getenv("HF_TOKEN"), 
+                                original_audio_data=original_audio_data)
+    
+    return all_output_records
+
+
+def audiosegment_to_waveform(audio_segment):
+    """Convert AudioSegment to waveform tensor."""
+    import numpy as np
+    import torch
+    
+    samples = np.array(audio_segment.get_array_of_samples()).astype(np.float32)
+    if audio_segment.channels == 2:
+        samples = samples.reshape((-1, 2)).T  # shape (channels, samples)
+    else:
+        samples = samples[np.newaxis, :]  # shape (1, samples)
+    samples /= (1 << (8 * audio_segment.sample_width - 1))  # normalize to [-1, 1]
+    return torch.from_numpy(samples), audio_segment.frame_rate
+    
+
+@app.function(
+    secrets=[s3_access_credentials],
+)
+def process_single_s3_file(file_data: Dict[str, Union[str, List[Dict[str, str]]]], romanize: bool = False) -> List[Dict[str, str]]:
+    """
+    Process a single S3 audio file for forced alignment.
+    This method is designed to be called in parallel via .map()
+    """
+    import gc
+    import numpy as np
+    import os
+    import re
+    import torch
+    import uroman as ur
+    import boto3
+    from fuzzywuzzy import fuzz
+    from pydub import AudioSegment
+    import io
+    
+    output_records = []
+    
+    try:
+        s3_path = file_data['s3_path']
+        bucket, key = s3_path.replace("s3://", "").split("/", 1)
+        if 'filename' in file_data:
+            filename = file_data['filename']
+        else:
+            filename = key.split('/')[-1].split('.')[0]
+        ref_text = file_data['ref_text']  # List of dicts with 'key' and 'text'
+
+        text_lines = [v['text'] for v in ref_text]
+        if 'key' in ref_text[0]:
+            text_refs = [v['key'] for v in ref_text]
+        else:
+            text_refs = [filename + '_' + str(i) for i in range(len(text_lines))]
+        chunk_text = '|' + '|'.join(text_lines).upper() + '|'
+
+        if romanize:
+            uroman = ur.Uroman()
+            chunk_text = uroman.romanize_string(chunk_text)
+            print("Romanized")
+        else:
+            print("Not Romanized")
+
+        # Filter unwanted characters
+        text_block = ''.join(c for c in chunk_text if c.isalpha() or c == '|')
+        text_block = text_block.replace('ʼ', '')
+        if not text_block.strip():
+            print(f"[WARNING] Empty or invalid text_block for file: {filename}")
+            return output_records
+
+        s3 = boto3.client("s3")
+        audio_obj = s3.get_object(Bucket=bucket, Key=key)
+        ext = os.path.splitext(s3_path)[-1].lower().lstrip('.')
+        section_audio = AudioSegment.from_file(io.BytesIO(audio_obj['Body'].read()), format=ext)
+
+        waveform, sr = audiosegment_to_waveform(section_audio)
+        if sr != 16000:
+            section_audio = section_audio.set_frame_rate(16000)
+            section_audio = section_audio.set_channels(1)
+            waveform, sr = audiosegment_to_waveform(section_audio)
+            sr = 16000
+            
+        break_segs, trellis, emissions = process_audio_and_align.remote(waveform, text_block)
+        ratio = waveform.size(1) / trellis.size(0)
+        
+        # Extract ASR segments
+        asr_segments = extract_asr_segments(emissions, break_segs, ratio)
+        
+        for i in range(len(break_segs)-1):
+            output_filename = text_refs[i].replace(
+                ' ', '_').replace(':', '_').replace('\n', '')
+            output_key = f'output/{output_filename}.wav'
+            x0_frames = int(ratio * break_segs[i].end)
+            if i + 1 < len(break_segs):
+                x1_frames = int(ratio * break_segs[i+1].start)
+            else:
+                x1_frames = waveform.size(1)
+            x0_seconds = round(x0_frames / sr, 3)
+            x1_seconds = round(x1_frames / sr, 3)
+            
+            # Use the corresponding ASR segment
+            asr_transcription = asr_segments[i].lower() if i < len(asr_segments) else ""
+            match_score = fuzz.ratio(text_lines[i], asr_transcription)
+            
+            # Append record as dictionary
+            output_records.append({
+                'filename': output_key,
+                'text': text_lines[i],
+                'source_file': filename,
+                'start': x0_seconds,
+                'end': x1_seconds,
+                'asr_transcription': asr_transcription,
+                'match_score': match_score
+            })
+            
+        print(f"Processed file: {filename}, created {len(output_records)} segments")
+            
+    except torch.cuda.OutOfMemoryError as e:
+        print(f"Skipping {filename} due to OOM: {e}")
+    # except Exception as e:
+    #     print(f"Error processing {filename}: {e}")
+    # finally:
+    #     # Clean up GPU memory
+    #     gc.collect()
+    #     torch.cuda.empty_cache()
+
+    return output_records
+    
 
 
 @app.function()
