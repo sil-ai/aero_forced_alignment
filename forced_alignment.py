@@ -441,7 +441,7 @@ def align_from_s3_parallel(
                 audio_obj = s3.get_object(Bucket=bucket, Key=key)
                 ext = os.path.splitext(s3_path)[-1].lower().lstrip('.')
                 section_audio = AudioSegment.from_file(io.BytesIO(audio_obj['Body'].read()), format=ext)
-                
+
                 waveform, sr = audiosegment_to_waveform(section_audio)
                 if sr != 16000:
                     section_audio = section_audio.set_frame_rate(16000)
