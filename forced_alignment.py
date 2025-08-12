@@ -263,6 +263,7 @@ class ForcedAligner:
                 ext = os.path.splitext(s3_path)[-1].lower().lstrip('.')
                 section_audio = AudioSegment.from_file(io.BytesIO(audio_obj['Body'].read()), format=ext)
 
+
                 waveform, sr = audiosegment_to_waveform(section_audio)
                 if sr != 16000:
                     section_audio = section_audio.set_frame_rate(16000)
@@ -278,6 +279,7 @@ class ForcedAligner:
                 for i in range(len(break_segs)-1):
                     output_filename = text_refs[i].replace(
                         ' ', '_').replace(':', '_').replace('\n', '')
+            
                     output_key = f'output/{output_filename}.wav'
                     x0_frames = int(ratio * break_segs[i].end)
                     if i + 1 < len(break_segs):
