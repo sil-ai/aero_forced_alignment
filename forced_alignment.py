@@ -254,6 +254,7 @@ class ForcedAligner:
 
                 # Filter unwanted characters
                 text_block = ''.join(c for c in chunk_text if c.isalpha() or c == '|')
+                text_block = text_block.replace('ʼ', '')
 
                 waveform, sr = audiosegment_to_waveform(section_audio)
                 if sr != 16000:
@@ -263,8 +264,7 @@ class ForcedAligner:
                     sr = 16000
                 break_segs, trellis = process_audio_and_align(waveform, text_block)
                 ratio = waveform.size(1) / trellis.size(0)
-                
-                for i in range(len(break_segs)):
+                for i in range(len(break_segs)-1):
                     output_filename = verse_refs[i].replace(
                         ' ', '_').replace(':', '_').replace('\n', '')
                     output_key = f'output/{output_filename}.wav'
@@ -493,6 +493,7 @@ class ForcedAligner:
 
                 # Filter unwanted characters
                 text_block = ''.join(c for c in chunk_text if c.isalpha() or c == '|')
+                text_block = text_block.replace('ʼ', '')
 
                 waveform, sr = audiosegment_to_waveform(section_audio)
                 if sr != 16000:
@@ -503,7 +504,7 @@ class ForcedAligner:
                 break_segs, trellis = process_audio_and_align(waveform, text_block)
                 ratio = waveform.size(1) / trellis.size(0)
                 
-                for i in range(len(break_segs)):
+                for i in range(len(break_segs)-1):
                     output_filename = verse_refs[i].replace(' ', '_').replace(':', '_')
                     output_key = f'output/{output_filename}.wav'
                     print(output_key)
