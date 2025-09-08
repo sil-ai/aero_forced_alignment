@@ -284,7 +284,7 @@ def align_from_dataset_parallel(
     id_column: str = None,
     max_words: int = 100,
     romanize: bool = False,
-    mms_lang: Optional[str] = None,  # MMS language code (e.g., 'ara', 'zho', 'hin')
+    mms_lang: Optional[str] = None,
     split: Optional[str] = None,
     limit: int = None,
     output_dataset_name: Optional[str] = None,
@@ -295,7 +295,7 @@ def align_from_dataset_parallel(
 
     Args:
         dataset_name: Name of the HF dataset
-        mms_lang: MMS language code (e.g., 'ara' for Arabic, 'zho' for Chinese)
+        mms_lang: MMS language code
         batch_size: Number of samples to process in parallel (limited by GPU availability)
         ... (other args same as original method)
 
@@ -397,7 +397,7 @@ def align_from_dataset_parallel(
 def align_from_s3_parallel(
     audio_files: List[Dict[str, Union[str, bytes, List[Dict[str, str]]]]],
     romanize: bool = False,
-    mms_lang: Optional[str] = None,  # MMS language code (e.g., 'ara', 'zho', 'hin')
+    mms_lang: Optional[str] = None,
     batch_size: int = 10,
     output_dataset_name: Optional[str] = None
 ) -> List[Dict[str, str]]:
@@ -407,7 +407,7 @@ def align_from_s3_parallel(
     Args:
         audio_files: List of file specifications
         romanize: Whether to romanize the text
-        mms_lang: MMS language code (e.g., 'ara' for Arabic, 'zho' for Chinese, 'hin' for Hindi)
+        mms_lang: MMS language code
         batch_size: Number of files to process in parallel (limited by GPU availability)
         output_dataset_name: Name of the dataset to create or update
         
@@ -541,8 +541,7 @@ def process_single_s3_file(file_data: Dict[str, Union[str, List[Dict[str, str]]]
         
         chunk_text = '|' + '|'.join(text_lines).upper() + '|'
 
-        # Apply romanization if requested or using MMS
-        if romanize or mms_lang:
+        if romanize:
             uroman = ur.Uroman()
             chunk_text = uroman.romanize_string(chunk_text)
             print(f"Romanized text for {'MMS-' + mms_lang if mms_lang else 'standard'} processing")
@@ -576,7 +575,7 @@ def process_single_s3_file(file_data: Dict[str, Union[str, List[Dict[str, str]]]
         ratio = waveform.size(1) / trellis.size(0)
 
         # Extract ASR segments
-        asr_segments = extract_asr_segments(emissions, break_segs, ratio, mms_lang)
+        asr_segments = extract_asr_segments(emissions, break_segs, ratio, mms_lang, romanize)
 
         prev_x1_seconds = 0
         for i in range(len(break_segs)-1):
@@ -595,6 +594,8 @@ def process_single_s3_file(file_data: Dict[str, Union[str, List[Dict[str, str]]]
             
             # Use the corresponding ASR segment
             asr_transcription = asr_segments[i].lower() if i < len(asr_segments) else ""
+            if romanize:
+                text_lines[i] = uroman.romanize_string(text_lines[i], lcode=mms_lang)
             match_score = fuzz.ratio(text_lines[i], asr_transcription)
 
             output_records.append({
@@ -711,7 +712,7 @@ def audioarray_to_waveform(audio_array, sample_rate):
 @app.function(
     gpu="L40S",
 )
-def process_audio_and_align(waveform, transcript_text, mms_lang=None):
+def process_audio_and_align(waveform, transcript_text, mms_lang=None, romanize=False):
     """Core alignment processing with optional MMS language support."""
     import torch
     import gc
@@ -850,9 +851,10 @@ def merge_repeats(path, transcript):
     return segments
 
 
-def extract_asr_segments(emissions, break_segs, ratio, mms_lang=None):
+def extract_asr_segments(emissions, break_segs, ratio, mms_lang=None, romanize=False):
     """Extract ASR transcriptions for each segment with optional MMS language support."""
     import torch
+    import uroman as ur
     from transformers import Wav2Vec2Processor
 
     # Use appropriate model
@@ -891,6 +893,9 @@ def extract_asr_segments(emissions, break_segs, ratio, mms_lang=None):
         segment_transcription = processor.batch_decode(predicted_ids.unsqueeze(0))[0]
 
         asr_segments.append(segment_transcription)
+        if romanize:
+            uroman = ur.Uroman()
+            asr_segments = [uroman.romanize_string(text, lcode=mms_lang) for text in asr_segments]
 
     return asr_segments
 
@@ -945,8 +950,7 @@ def process_single_dataset_sample(
     # Create combined text for alignment
     chunk_text = '|' + '|'.join(text_chunks).upper() + '|'
 
-    # Apply romanization if requested or using MMS
-    if romanize or mms_lang:
+    if romanize:
         uroman = ur.Uroman()
         chunk_text = uroman.romanize_string(chunk_text)
         print(f"Romanized text for {'MMS-' + mms_lang if mms_lang else 'standard'} processing")
@@ -967,7 +971,7 @@ def process_single_dataset_sample(
     ratio = waveform.size(1) / trellis.size(0)
     
     # Extract ASR segments
-    asr_segments = extract_asr_segments(emissions, break_segs, ratio, mms_lang)
+    asr_segments = extract_asr_segments(emissions, break_segs, ratio, mms_lang, romanize)
 
     # Create output records for each chunk
     prev_x1_seconds = 0
@@ -988,6 +992,8 @@ def process_single_dataset_sample(
 
             # Use the corresponding ASR segment
             asr_transcription = asr_segments[i].lower() if i < len(asr_segments) else ""
+            if romanize:
+                text_chunks[i] = uroman.romanize_string(text_chunks[i], lcode=mms_lang)
             match_score = fuzz.ratio(text_chunks[i].lower(), asr_transcription)
 
             # Append record
