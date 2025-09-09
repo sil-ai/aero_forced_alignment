@@ -30,6 +30,10 @@ s3_access_credentials = modal.Secret.from_name("my-aws-secret")
 
 app = modal.App("general-forced-alignment", image=image)
 
+# Model selection - use English by default, MMS for other languages
+DEFAULT_MODEL = "facebook/wav2vec2-base-960h"  # English
+MMS_MODEL = "facebook/mms-1b-all"  # Massively Multilingual Speech model
+
 
 @app.function(
     secrets=[modal.Secret.from_name("my-huggingface-secret")],
@@ -274,22 +278,24 @@ def push_to_hf_dataset(output_records: List[Dict[str, str]],
     timeout=3600,
 )
 def align_from_dataset_parallel(
-                        dataset_name: str,
-                        text_column: str = "text",
-                        audio_column: str = "audio",
-                        id_column: str = None,
-                        max_words: int = 100,
-                        romanize: bool = False,
-                        split: Optional[str] = None,
-                        limit: int = None,
-                        output_dataset_name: Optional[str] = None,
-                        batch_size: int = 100,
-                        ) -> List[Dict[str, str]]:
+    dataset_name: str,
+    text_column: str = "text",
+    audio_column: str = "audio",
+    id_column: str = None,
+    max_words: int = 100,
+    romanize: bool = False,
+    mms_lang: Optional[str] = None,
+    split: Optional[str] = None,
+    limit: int = None,
+    output_dataset_name: Optional[str] = None,
+    batch_size: int = 100,
+) -> List[Dict[str, str]]:
     """
     Perform forced alignment on audio and text from a Hugging Face dataset using parallel processing.
 
     Args:
         dataset_name: Name of the HF dataset
+        mms_lang: MMS language code
         batch_size: Number of samples to process in parallel (limited by GPU availability)
         ... (other args same as original method)
 
@@ -365,7 +371,8 @@ def align_from_dataset_parallel(
                 [audio_column] * len(batch),
                 [id_column] * len(batch),
                 [max_words] * len(batch),
-                [romanize] * len(batch)
+                [romanize] * len(batch),
+                [mms_lang] * len(batch)  # Pass MMS language code
             ))
 
             # Flatten results from batch
@@ -383,23 +390,27 @@ def align_from_dataset_parallel(
 
     return all_output_records
 
+
 @app.function(
     timeout=3600,
 )
 def align_from_s3_parallel(
-                    audio_files: List[Dict[str, Union[str, bytes, List[Dict[str, str]]]]],
-                    romanize: bool = False,
-                    batch_size: int = 10,
-                    output_dataset_name: Optional[str] = None) -> List[Dict[str, str]]:
+    audio_files: List[Dict[str, Union[str, bytes, List[Dict[str, str]]]]],
+    romanize: bool = False,
+    mms_lang: Optional[str] = None,
+    batch_size: int = 10,
+    output_dataset_name: Optional[str] = None
+) -> List[Dict[str, str]]:
     """
-    Perform forced alignment on S3 audio files using parallel processing.
-
+    Perform forced alignment on S3 audio files using parallel processing with MMS language support.
+    
     Args:
         audio_files: List of file specifications
         romanize: Whether to romanize the text
+        mms_lang: MMS language code
         batch_size: Number of files to process in parallel (limited by GPU availability)
         output_dataset_name: Name of the dataset to create or update
-
+        
     Returns:
         List of dictionaries with alignment results
     """
@@ -421,9 +432,9 @@ def align_from_s3_parallel(
         # Use Modal's .map() to process batch in parallel
         batch_results = list(process_single_s3_file.map(
             batch,
-            [romanize] * len(batch)
+            [romanize] * len(batch),
+            [mms_lang] * len(batch)  # Pass MMS language code
         ))
-
 
         # Collect original audio data for each file in the batch
         for j, file_data in enumerate(batch):
@@ -489,10 +500,16 @@ def audiosegment_to_waveform(audio_segment):
 @app.function(
     secrets=[s3_access_credentials],
 )
-def process_single_s3_file(file_data: Dict[str, Union[str, List[Dict[str, str]]]], romanize: bool = False) -> List[Dict[str, str]]:
+def process_single_s3_file(file_data: Dict[str, Union[str, List[Dict[str, str]]]], 
+                          romanize: bool = False, 
+                          mms_lang: Optional[str] = None) -> List[Dict[str, str]]:
     """
-    Process a single S3 audio file for forced alignment.
-    This method is designed to be called in parallel via .map()
+    Process a single S3 audio file for forced alignment with optional MMS language support.
+    
+    Args:
+        file_data: File specification with s3_path and ref_text
+        romanize: Whether to romanize the text
+        mms_lang: MMS language code
     """
     import gc
     import numpy as np
@@ -521,18 +538,20 @@ def process_single_s3_file(file_data: Dict[str, Union[str, List[Dict[str, str]]]
             text_refs = [v['key'] for v in ref_text]
         else:
             text_refs = [filename + '_' + str(i) for i in range(len(text_lines))]
+        
         chunk_text = '|' + '|'.join(text_lines).upper() + '|'
 
         if romanize:
             uroman = ur.Uroman()
             chunk_text = uroman.romanize_string(chunk_text)
-            print("Romanized")
+            print(f"Romanized text for {'MMS-' + mms_lang if mms_lang else 'standard'} processing")
         else:
-            print("Not Romanized")
+            print("Using original text")
 
         # Filter unwanted characters
         text_block = ''.join(c for c in chunk_text if c.isalpha() or c == '|')
         text_block = text_block.replace('ʼ', '')
+        
         if not text_block.strip():
             print(f"[WARNING] Empty or invalid text_block for file: {filename}")
             return output_records
@@ -549,16 +568,18 @@ def process_single_s3_file(file_data: Dict[str, Union[str, List[Dict[str, str]]]
             waveform, sr = audiosegment_to_waveform(section_audio)
             sr = 16000
 
-        break_segs, trellis, emissions = process_audio_and_align.remote(waveform, text_block)
+        # Perform alignment with appropriate model
+        break_segs, trellis, emissions = process_audio_and_align.remote(
+            waveform, text_block, mms_lang
+        )
         ratio = waveform.size(1) / trellis.size(0)
 
         # Extract ASR segments
-        asr_segments = extract_asr_segments(emissions, break_segs, ratio)
+        asr_segments = extract_asr_segments(emissions, break_segs, ratio, mms_lang, romanize)
 
         prev_x1_seconds = 0
         for i in range(len(break_segs)-1):
-            output_filename = text_refs[i].replace(
-                ' ', '_').replace(':', '_').replace('\n', '')
+            output_filename = text_refs[i].replace(' ', '_').replace(':', '_').replace('\n', '')
             output_key = f'output/{output_filename}.wav'
             x0_frames = int(ratio * break_segs[i].end)
             if i + 1 < len(break_segs):
@@ -570,11 +591,13 @@ def process_single_s3_file(file_data: Dict[str, Union[str, List[Dict[str, str]]]
             x0_seconds = x0_seconds - 0.1
             if x0_seconds < prev_x1_seconds:
                 x0_seconds = prev_x1_seconds
+            
             # Use the corresponding ASR segment
             asr_transcription = asr_segments[i].lower() if i < len(asr_segments) else ""
+            if romanize:
+                text_lines[i] = uroman.romanize_string(text_lines[i], lcode=mms_lang)
             match_score = fuzz.ratio(text_lines[i], asr_transcription)
 
-            # Append record as dictionary
             output_records.append({
                 'filename': output_key,
                 'text': text_lines[i],
@@ -582,7 +605,8 @@ def process_single_s3_file(file_data: Dict[str, Union[str, List[Dict[str, str]]]
                 'start': x0_seconds,
                 'end': x1_seconds,
                 'asr_transcription': asr_transcription,
-                'match_score': match_score
+                'match_score': match_score,
+                'mms_language': mms_lang
             })
             prev_x1_seconds = x1_seconds
 
@@ -590,154 +614,164 @@ def process_single_s3_file(file_data: Dict[str, Union[str, List[Dict[str, str]]]
 
     except torch.cuda.OutOfMemoryError as e:
         print(f"Skipping {filename} due to OOM: {e}")
-    # except Exception as e:
-    #     print(f"Error processing {filename}: {e}")
-    # finally:
-    #     # Clean up GPU memory
-    #     gc.collect()
-    #     torch.cuda.empty_cache()
+    except Exception as e:
+        print(f"Error processing {filename}: {e}")
+    finally:
+        # Clean up GPU memory
+        gc.collect()
+        torch.cuda.empty_cache()
 
     return output_records
 
 
-
 @app.function()
 def split_text_into_chunks(text, max_words):
-        """Split text into chunks based on sentences with max word limit."""
-        import re
+    """Split text into chunks based on sentences with max word limit."""
+    import re
 
-        # Split by sentence-ending punctuation but keep the punctuation
-        # Use capturing groups to keep the delimiters
-        parts = re.split(r'([.!?]+)', text)
 
-        # Reconstruct sentences with their punctuation
-        sentences = []
-        for i in range(0, len(parts), 2):
-            sentence = parts[i].strip()
-            if sentence:  # Only add non-empty sentences
-                # Add punctuation if it exists
-                if i + 1 < len(parts) and parts[i + 1]:
-                    sentence += parts[i + 1]
-                sentences.append(sentence)
+    parts = re.split(r'([.!?]+)', text)
 
-        chunks = []
-        current_chunk = ""
-        current_word_count = 0
+    # Reconstruct sentences with their punctuation
+    sentences = []
+    for i in range(0, len(parts), 2):
+        sentence = parts[i].strip()
+        if sentence:  # Only add non-empty sentences
+            # Add punctuation if it exists
+            if i + 1 < len(parts) and parts[i + 1]:
+                sentence += parts[i + 1]
+            sentences.append(sentence)
 
-        for sentence in sentences:
-            words = sentence.split()
-            sentence_word_count = len(words)
+    chunks = []
+    current_chunk = ""
+    current_word_count = 0
 
-            # If adding this sentence would exceed max_words
-            if current_word_count + sentence_word_count > max_words and current_chunk:
-                chunks.append(current_chunk.strip())
-                current_chunk = sentence
-                current_word_count = sentence_word_count
-            else:
-                # Add sentence to current chunk
-                if current_chunk:
-                    current_chunk += " " + sentence
-                else:
-                    current_chunk = sentence
-                current_word_count += sentence_word_count
+    for sentence in sentences:
+        words = sentence.split()
+        sentence_word_count = len(words)
 
-            # If a single sentence exceeds max_words, split it further
-            if sentence_word_count > max_words:
-                if current_chunk != sentence:  # Save previous chunk first
-                    chunks.append(current_chunk.replace(sentence, "").strip())
-
-                # Split long sentence into word chunks
-                words = sentence.split()
-                for i in range(0, len(words), max_words):
-                    word_chunk = " ".join(words[i:i + max_words])
-                    chunks.append(word_chunk)
-
-                current_chunk = ""
-                current_word_count = 0
-
-        # Add remaining chunk
-        if current_chunk.strip():
+        # If adding this sentence would exceed max_words
+        if current_word_count + sentence_word_count > max_words and current_chunk:
             chunks.append(current_chunk.strip())
+            current_chunk = sentence
+            current_word_count = sentence_word_count
+        else:
+            # Add sentence to current chunk
+            if current_chunk:
+                current_chunk += " " + sentence
+            else:
+                current_chunk = sentence
+            current_word_count += sentence_word_count
 
-        return chunks
+        # If a single sentence exceeds max_words, split it further
+        if sentence_word_count > max_words:
+            if current_chunk != sentence:  # Save previous chunk first
+                chunks.append(current_chunk.replace(sentence, "").strip())
 
-# @app.function()
-#     gpu="L40S",
-# )
+            # Split long sentence into word chunks
+            words = sentence.split()
+            for i in range(0, len(words), max_words):
+                word_chunk = " ".join(words[i:i + max_words])
+                chunks.append(word_chunk)
+
+            current_chunk = ""
+            current_word_count = 0
+
+    # Add remaining chunk
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+
+    return chunks
+
+
 def audioarray_to_waveform(audio_array, sample_rate):
-        """Convert audio array from dataset to waveform tensor."""
-        import numpy as np
-        import torch
-        import librosa
+    """Convert audio array from dataset to waveform tensor."""
+    import numpy as np
+    import torch
+    import librosa
 
-        # Ensure mono
-        if len(audio_array.shape) > 1:
-            audio_array = np.mean(audio_array, axis=1)
+    # Ensure mono
+    if len(audio_array.shape) > 1:
+        audio_array = np.mean(audio_array, axis=1)
 
-        # Normalize to [-1, 1]
-        if audio_array.dtype == np.int16:
-            audio_array = audio_array.astype(np.float32) / 32768.0
-        elif audio_array.dtype == np.int32:
-            audio_array = audio_array.astype(np.float32) / 2147483648.0
+    # Normalize to [-1, 1]
+    if audio_array.dtype == np.int16:
+        audio_array = audio_array.astype(np.float32) / 32768.0
+    elif audio_array.dtype == np.int32:
+        audio_array = audio_array.astype(np.float32) / 2147483648.0
 
-        # Resample to 16kHz if needed
-        if sample_rate != 16000:
-            audio_array = librosa.resample(audio_array, orig_sr=sample_rate, target_sr=16000)
-            sample_rate = 16000
+    # Resample to 16kHz if needed
+    if sample_rate != 16000:
+        audio_array = librosa.resample(audio_array, orig_sr=sample_rate, target_sr=16000)
+        sample_rate = 16000
 
-        waveform = torch.from_numpy(audio_array).unsqueeze(0)  # Add channel dimension
-        return waveform, sample_rate
+    waveform = torch.from_numpy(audio_array).unsqueeze(0)  # Add channel dimension
+    return waveform, sample_rate
 
 
 @app.function(
     gpu="L40S",
 )
-def process_audio_and_align(waveform, transcript_text):
-        """Core alignment processing shared between methods."""
-        import torch
-        import gc
-        from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
+def process_audio_and_align(waveform, transcript_text, mms_lang=None, romanize=False):
+    """Core alignment processing with optional MMS language support."""
+    import torch
+    import gc
+    from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
-        model_name = "facebook/wav2vec2-base-960h"
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        processor = Wav2Vec2Processor.from_pretrained(model_name, cache_dir=CACHE_DIR)
-        model = Wav2Vec2ForCTC.from_pretrained(model_name, cache_dir=CACHE_DIR).to(device)
-        labels = processor.tokenizer.convert_ids_to_tokens(list(range(model.lm_head.out_features)))
-        label_dict = {c: i for i, c in enumerate(labels)}
+    # Select model based on language
+    if mms_lang:
+        model_name = MMS_MODEL
+        print(f"Using MMS model for language: {mms_lang}")
+    else:
+        model_name = DEFAULT_MODEL
+        print("Using default English model")
+    
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    processor = Wav2Vec2Processor.from_pretrained(model_name, cache_dir=CACHE_DIR)
+    model = Wav2Vec2ForCTC.from_pretrained(model_name, cache_dir=CACHE_DIR).to(device)
+    
+    # Set target language for MMS model
+    if mms_lang and hasattr(processor.tokenizer, 'set_target_lang'):
+        processor.tokenizer.set_target_lang(mms_lang)
+        model.load_adapter(mms_lang)
+        print(f"Set MMS target language to: {mms_lang}")
+    
+    labels = processor.tokenizer.convert_ids_to_tokens(list(range(model.lm_head.out_features)))
+    label_dict = {c: i for i, c in enumerate(labels)}
 
-        waveform = waveform.mean(dim=0)
-        print("Transcript Text: " + transcript_text.strip().replace("\n", "|"))
-        transcript_tokens = list(transcript_text.strip().replace("\n", "|"))
+    waveform = waveform.mean(dim=0)
+    print("Transcript Text: " + transcript_text.strip().replace("\n", "|"))
+    transcript_tokens = list(transcript_text.strip().replace("\n", "|"))
 
-        token_ids = [label_dict[p] for p in transcript_tokens if p in label_dict]
-        if not token_ids:
-            raise ValueError("None of the tokens in transcript were found in the model label set.")
+    token_ids = [label_dict[p] for p in transcript_tokens if p in label_dict]
+    if not token_ids:
+        raise ValueError("None of the tokens in transcript were found in the model label set.")
 
-        try:
-            input_values = processor(waveform, sampling_rate=16000, return_tensors="pt").input_values.to(device)
-            with torch.no_grad():
-                emissions = model(input_values).logits
-            emissions = torch.log_softmax(emissions, dim=-1)[0]
+    try:
+        input_values = processor(waveform, sampling_rate=16000, return_tensors="pt").input_values.to(device)
+        with torch.no_grad():
+            emissions = model(input_values).logits
+        emissions = torch.log_softmax(emissions, dim=-1)[0]
 
-            trellis = get_trellis(emissions, token_ids, device)
-            path = backtrack(trellis, emissions, token_ids)
-            segments = merge_repeats(path, transcript_tokens)
-            print("Segments: " + str(segments[:5]))
-            break_segs = [seg for seg in segments if seg.label == "|"]
-            trellis   = trellis.cpu()
-            emissions = emissions.cpu()
+        trellis = get_trellis(emissions, token_ids, device)
+        path = backtrack(trellis, emissions, token_ids)
+        segments = merge_repeats(path, transcript_tokens)
+        print("Segments: " + str(segments[:5]))
+        break_segs = [seg for seg in segments if seg.label == "|"]
+        trellis = trellis.cpu()
+        emissions = emissions.cpu()
 
-            return break_segs, trellis, emissions
+        return break_segs, trellis, emissions
 
-        finally:
-            # Clean up GPU memory
-            del input_values
-            if 'emissions' in locals():
-                del emissions
-            if 'segments' in locals():
-                del segments
-            gc.collect()
-            torch.cuda.empty_cache()
+    finally:
+        # Clean up GPU memory
+        del input_values
+        if 'emissions' in locals():
+            del emissions
+        if 'segments' in locals():
+            del segments
+        gc.collect()
+        torch.cuda.empty_cache()
 
 
 def get_trellis(emission, tokens, device, blank_id=0):
@@ -757,9 +791,10 @@ def get_trellis(emission, tokens, device, blank_id=0):
         )
     return trellis
 
+
 def backtrack(trellis, emission, tokens, blank_id=0):
     """Backtrack through trellis to find optimal path."""
-
+    
     @dataclass
     class Point:
         token_index: int
@@ -795,8 +830,9 @@ def merge_repeats(path, transcript):
         end: int
         score: float
 
-    def __repr__(self):
-        return f"{self.label}\t({self.score:4.2f}): [{self.start:5d}, {self.end:5d})"
+        def __repr__(self):
+            return f"{self.label}\t({self.score:4.2f}): [{self.start:5d}, {self.end:5d})"
+    
     i1, i2 = 0, 0
     segments = []
     while i1 < len(path):
@@ -815,14 +851,20 @@ def merge_repeats(path, transcript):
     return segments
 
 
-def extract_asr_segments(emissions, break_segs, ratio, model_name="facebook/wav2vec2-base-960h"):
-    """Extract ASR transcriptions for each segment."""
+def extract_asr_segments(emissions, break_segs, ratio, mms_lang=None, romanize=False):
+    """Extract ASR transcriptions for each segment with optional MMS language support."""
     import torch
+    import uroman as ur
     from transformers import Wav2Vec2Processor
 
+    # Use appropriate model
+    model_name = MMS_MODEL if mms_lang else DEFAULT_MODEL
     processor = Wav2Vec2Processor.from_pretrained(model_name, cache_dir=CACHE_DIR)
-
-
+    
+    # Set target language for MMS
+    if mms_lang and hasattr(processor.tokenizer, 'set_target_lang'):
+        processor.tokenizer.set_target_lang(mms_lang)
+    
     asr_segments = []
 
     for i in range(len(break_segs) - 1):
@@ -851,24 +893,28 @@ def extract_asr_segments(emissions, break_segs, ratio, model_name="facebook/wav2
         segment_transcription = processor.batch_decode(predicted_ids.unsqueeze(0))[0]
 
         asr_segments.append(segment_transcription)
+        if romanize:
+            uroman = ur.Uroman()
+            asr_segments = [uroman.romanize_string(text, lcode=mms_lang) for text in asr_segments]
 
     return asr_segments
 
 
 @app.function(timeout=600)
 def process_single_dataset_sample(
-                                sample_dict,
-                                idx,
-                                dataset_name: str,
-                                split: str,
-                                text_column: str,
-                                audio_column: str,
-                                id_column: Optional[str],
-                                max_words: int,
-                                romanize: bool) -> List[Dict[str, str]]:
+    sample_dict,
+    idx,
+    dataset_name: str,
+    split: str,
+    text_column: str,
+    audio_column: str,
+    id_column: Optional[str],
+    max_words: int,
+    romanize: bool,
+    mms_lang: Optional[str] = None
+) -> List[Dict[str, str]]:
     """
-    Process a single dataset sample for forced alignment.
-    This method is designed to be called in parallel via .map()
+    Process a single dataset sample for forced alignment with optional MMS language support.
     """
     import uroman as ur
     from fuzzywuzzy import fuzz
@@ -907,9 +953,9 @@ def process_single_dataset_sample(
     if romanize:
         uroman = ur.Uroman()
         chunk_text = uroman.romanize_string(chunk_text)
-        print("Romanized")
+        print(f"Romanized text for {'MMS-' + mms_lang if mms_lang else 'standard'} processing")
     else:
-        print("Not Romanized")
+        print("Using original text")
 
     # Filter unwanted characters
     text_block = ''.join(c for c in chunk_text if c.isalpha() or c == '|')
@@ -920,13 +966,12 @@ def process_single_dataset_sample(
         return output_records
 
     # Perform alignment
-    # kick off the GPU call
-    break_segs, trellis, emissions = process_audio_and_align.remote(waveform, text_block)
+    break_segs, trellis, emissions = process_audio_and_align.remote(waveform, text_block, mms_lang)
 
     ratio = waveform.size(1) / trellis.size(0)
-
-    # same thing for ASR extraction
-    asr_segments = extract_asr_segments(emissions, break_segs, ratio)
+    
+    # Extract ASR segments
+    asr_segments = extract_asr_segments(emissions, break_segs, ratio, mms_lang, romanize)
 
     # Create output records for each chunk
     prev_x1_seconds = 0
@@ -947,6 +992,8 @@ def process_single_dataset_sample(
 
             # Use the corresponding ASR segment
             asr_transcription = asr_segments[i].lower() if i < len(asr_segments) else ""
+            if romanize:
+                text_chunks[i] = uroman.romanize_string(text_chunks[i], lcode=mms_lang)
             match_score = fuzz.ratio(text_chunks[i].lower(), asr_transcription)
 
             # Append record
@@ -962,7 +1009,8 @@ def process_single_dataset_sample(
                 'asr_transcription': asr_transcription,
                 'match_score': match_score,
                 'dataset_name': dataset_name,
-                'split': split
+                'split': split,
+                'mms_language': mms_lang
             })
             prev_x1_seconds = x1_seconds
 
