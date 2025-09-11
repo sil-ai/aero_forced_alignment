@@ -91,6 +91,9 @@ def push_to_hf_dataset(output_records: List[Dict[str, str]],
         for i, record in enumerate(records):
             # Create a copy of each record
             new_record = record.copy()
+            
+            if 'mms_language' in new_record:
+                del new_record['mms_language']
 
             # If including audio, extract segments for each record
             if include_audio and original_audio_data:
@@ -372,7 +375,7 @@ def align_from_dataset_parallel(
                 [id_column] * len(batch),
                 [max_words] * len(batch),
                 [romanize] * len(batch),
-                [mms_lang] * len(batch)  # Pass MMS language code
+                [mms_lang or None] * len(batch)  # Pass MMS language code (None for English)
             ))
 
             # Flatten results from batch
@@ -433,7 +436,7 @@ def align_from_s3_parallel(
         batch_results = list(process_single_s3_file.map(
             batch,
             [romanize] * len(batch),
-            [mms_lang] * len(batch)  # Pass MMS language code
+            [mms_lang or None] * len(batch)  # Pass MMS language code (None for English)
         ))
 
         # Collect original audio data for each file in the batch
@@ -470,6 +473,9 @@ def align_from_s3_parallel(
         # Flatten results from batch
         for result in batch_results:
             all_output_records.extend(result)
+        for record in all_output_records:
+            if 'mms_language' in record:
+                del record['mms_language']
 
         print(f"Completed batch, total segments so far: {len(all_output_records)}")
 
@@ -499,6 +505,7 @@ def audiosegment_to_waveform(audio_segment):
 
 @app.function(
     secrets=[s3_access_credentials],
+    timeout=3600,
 )
 def process_single_s3_file(file_data: Dict[str, Union[str, List[Dict[str, str]]]], 
                           romanize: bool = False, 
@@ -570,7 +577,7 @@ def process_single_s3_file(file_data: Dict[str, Union[str, List[Dict[str, str]]]
 
         # Perform alignment with appropriate model
         break_segs, trellis, emissions = process_audio_and_align.remote(
-            waveform, text_block, mms_lang
+            waveform, text_block, mms_lang, romanize
         )
         ratio = waveform.size(1) / trellis.size(0)
 
@@ -594,9 +601,12 @@ def process_single_s3_file(file_data: Dict[str, Union[str, List[Dict[str, str]]]
             
             # Use the corresponding ASR segment
             asr_transcription = asr_segments[i].lower() if i < len(asr_segments) else ""
+            # For match score comparison, use romanized text if romanization was applied
+            text_for_comparison = text_lines[i]
             if romanize:
-                text_lines[i] = uroman.romanize_string(text_lines[i], lcode=mms_lang)
-            match_score = fuzz.ratio(text_lines[i], asr_transcription)
+                uroman = ur.Uroman()
+                text_for_comparison = uroman.romanize_string(text_lines[i], lcode=mms_lang if mms_lang else None)
+            match_score = fuzz.ratio(text_for_comparison, asr_transcription)
 
             output_records.append({
                 'filename': output_key,
@@ -605,8 +615,7 @@ def process_single_s3_file(file_data: Dict[str, Union[str, List[Dict[str, str]]]
                 'start': x0_seconds,
                 'end': x1_seconds,
                 'asr_transcription': asr_transcription,
-                'match_score': match_score,
-                'mms_language': mms_lang
+                'match_score': match_score
             })
             prev_x1_seconds = x1_seconds
 
@@ -893,9 +902,11 @@ def extract_asr_segments(emissions, break_segs, ratio, mms_lang=None, romanize=F
         segment_transcription = processor.batch_decode(predicted_ids.unsqueeze(0))[0]
 
         asr_segments.append(segment_transcription)
-        if romanize:
-            uroman = ur.Uroman()
-            asr_segments = [uroman.romanize_string(text, lcode=mms_lang) for text in asr_segments]
+
+    # Apply romanization to all segments if requested
+    if romanize:
+        uroman = ur.Uroman()
+        asr_segments = [uroman.romanize_string(text, lcode=mms_lang if mms_lang else None) for text in asr_segments]
 
     return asr_segments
 
@@ -966,7 +977,7 @@ def process_single_dataset_sample(
         return output_records
 
     # Perform alignment
-    break_segs, trellis, emissions = process_audio_and_align.remote(waveform, text_block, mms_lang)
+    break_segs, trellis, emissions = process_audio_and_align.remote(waveform, text_block, mms_lang, romanize)
 
     ratio = waveform.size(1) / trellis.size(0)
     
@@ -992,9 +1003,12 @@ def process_single_dataset_sample(
 
             # Use the corresponding ASR segment
             asr_transcription = asr_segments[i].lower() if i < len(asr_segments) else ""
+            # For match score comparison, use romanized text if romanization was applied
+            text_for_comparison = text_chunks[i].lower()
             if romanize:
-                text_chunks[i] = uroman.romanize_string(text_chunks[i], lcode=mms_lang)
-            match_score = fuzz.ratio(text_chunks[i].lower(), asr_transcription)
+                uroman = ur.Uroman()
+                text_for_comparison = uroman.romanize_string(text_chunks[i], lcode=mms_lang if mms_lang else None).lower()
+            match_score = fuzz.ratio(text_for_comparison, asr_transcription)
 
             # Append record
             output_records.append({
@@ -1010,7 +1024,6 @@ def process_single_dataset_sample(
                 'match_score': match_score,
                 'dataset_name': dataset_name,
                 'split': split,
-                'mms_language': mms_lang
             })
             prev_x1_seconds = x1_seconds
 
