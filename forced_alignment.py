@@ -505,6 +505,7 @@ def audiosegment_to_waveform(audio_segment):
 
 @app.function(
     secrets=[s3_access_credentials],
+    timeout=3600,
 )
 def process_single_s3_file(file_data: Dict[str, Union[str, List[Dict[str, str]]]], 
                           romanize: bool = False, 
