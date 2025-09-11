@@ -12,7 +12,7 @@ image = (
         "transformers",
         "phonemizer",
         "pydub",
-        "numpy",
+        "numpy==1.24.3",  # Pin to specific compatible version
         "pandas",
         "uroman",
         "inflect",
@@ -34,16 +34,25 @@ app = modal.App("general-forced-alignment", image=image)
 DEFAULT_MODEL = "facebook/wav2vec2-base-960h"  # English
 MMS_MODEL = "facebook/mms-1b-all"  # Massively Multilingual Speech model
 
+import io
+import modal
+from typing import List, Dict, Union, Optional
+from dataclasses import dataclass
+import os
+import numpy as np
+from datasets import Dataset, DatasetDict, Features, Value, Audio
+import torch
+import gc
 
 @app.function(
     secrets=[modal.Secret.from_name("my-huggingface-secret")],
     timeout=1200,
 )
 def push_to_hf_dataset(output_records: List[Dict[str, str]],
-                    output_dataset_name: Optional[str] = None,
-                    token: Optional[str] = None,
-                    include_audio: bool = True,
-                    original_audio_data: Optional[Dict[str, any]] = None) -> str:
+                       output_dataset_name: Optional[str] = None,
+                       token: Optional[str] = None,
+                       include_audio: bool = True,
+                       original_audio_data: Optional[Dict[str, any]] = None) -> str:
     """
     Push the alignment results to a Hugging Face dataset, preserving original splits.
 
@@ -57,20 +66,14 @@ def push_to_hf_dataset(output_records: List[Dict[str, str]],
     Returns:
         The name of the created or updated dataset
     """
-    import os
-    import numpy as np
-    from datasets import Dataset, DatasetDict, Features, Value, Audio
-    import torch
-
     if not output_records:
         raise ValueError("No records to push to dataset")
 
     print(f"Processing {len(output_records)} records for dataset creation")
 
-    # Group records by split
     split_records = {}
     for record in output_records:
-        split_name = record.get('split', 'train')  # Default to 'train' if no split specified
+        split_name = record.get('split', 'train')
         if split_name not in split_records:
             split_records[split_name] = []
         split_records[split_name].append(record)
@@ -79,197 +82,126 @@ def push_to_hf_dataset(output_records: List[Dict[str, str]],
     for split_name, records in split_records.items():
         print(f"  {split_name}: {len(records)} records")
 
-    # Process each split separately
     datasets_by_split = {}
 
     for split_name, records in split_records.items():
         print(f"Processing split: {split_name}")
 
-        # Create a copy of records to avoid modifying the original
         processed_records = []
+        max_audio_length = 0
+        audio_data_list = []
 
         for i, record in enumerate(records):
-            # Create a copy of each record
             new_record = record.copy()
-            
             if 'mms_language' in new_record:
                 del new_record['mms_language']
 
-            # If including audio, extract segments for each record
             if include_audio and original_audio_data:
                 source_id = record.get('source_sample_id') or record.get('source_file')
-
                 if source_id and source_id in original_audio_data:
                     try:
                         audio_info = original_audio_data[source_id]
-                        waveform = audio_info['waveform']
+                        waveform = np.array(audio_info['waveform'])  # Convert back from list
+                        if waveform.ndim == 1:
+                            waveform = waveform[np.newaxis, :]  # Add channel dimension if needed
                         sample_rate = audio_info['sample_rate']
-
-                        # Extract audio segment based on start/end times
                         start_sample = int(record['start'] * sample_rate)
                         end_sample = int(record['end'] * sample_rate)
-
-                        # Ensure we don't go out of bounds
-                        if isinstance(waveform, torch.Tensor):
-                            if waveform.dim() > 1:
-                                audio_segment = waveform[:, start_sample:end_sample]
-                                # Convert to mono if needed
-                                if audio_segment.shape[0] > 1:
-                                    audio_segment = audio_segment.mean(dim=0)
-                                else:
-                                    audio_segment = audio_segment.squeeze(0)
-                            else:
-                                audio_segment = waveform[start_sample:end_sample]
+                        
+                        # waveform is now always a numpy array
+                        if waveform.ndim > 1:
+                            audio_segment = waveform[:, start_sample:end_sample].squeeze(0)
                         else:
-                            # Handle numpy arrays
-                            if len(waveform.shape) > 1:
-                                audio_segment = waveform[:, start_sample:end_sample]
-                                if audio_segment.shape[0] > 1:
-                                    audio_segment = audio_segment.mean(axis=0)
-                                else:
-                                    audio_segment = audio_segment.squeeze(0)
-                            else:
-                                audio_segment = waveform[start_sample:end_sample]
+                            audio_segment = waveform[start_sample:end_sample]
 
-                        # Ensure it's a proper 1D numpy array with float32 dtype
-                        audio_segment = np.array(audio_segment, dtype=np.float32)
                         if audio_segment.ndim > 1:
-                            audio_segment = audio_segment.flatten()
+                            audio_segment = audio_segment.mean(axis=0)
 
-                        # Validate the audio segment
-                        if len(audio_segment) == 0:
-                            print(f"Warning: Empty audio segment for record {i} in {split_name}, source: {source_id}")
-                            # Skip adding audio for this record but keep the record
-                            processed_records.append(new_record)
-                            continue
+                        if audio_segment.dtype != np.float32:
+                            audio_segment = audio_segment.astype(np.float32)
 
-                        # Debug: print type and shape info for first few records
-                        if i < 3:
-                            print(f"Record {i} ({split_name}): audio_segment type={type(audio_segment)}, shape={audio_segment.shape}, dtype={audio_segment.dtype}")
-                            print(f"Record {i} ({split_name}): sample_rate={sample_rate}, audio length={len(audio_segment)}")
+                        new_record['audio_array'] = audio_segment
+                        new_record['audio_sample_rate'] = int(sample_rate)
 
-                        # Add audio data to record in the exact format expected by HF
-                        new_record['audio'] = {
-                            'array': audio_segment,
-                            'sampling_rate': int(sample_rate)
-                        }
+                        max_audio_length = max(max_audio_length, len(audio_segment))
+                        audio_data_list.append(new_record)
 
                     except Exception as e:
                         print(f"Error processing audio for record {i} in {split_name}, source {source_id}: {e}")
-                        # Skip this record's audio but keep the record
                         processed_records.append(new_record)
-                        continue
                 else:
                     print(f"Warning: No audio data found for source: {source_id}")
-
-            processed_records.append(new_record)
-
-        # Filter records that have audio if we're supposed to include audio
-        if include_audio:
-            records_with_audio = [r for r in processed_records if 'audio' in r]
-            print(f"Records with audio in {split_name}: {len(records_with_audio)} out of {len(processed_records)}")
-
-            if len(records_with_audio) == 0:
-                print(f"Warning: No records have audio data in {split_name}, creating dataset without audio")
-                include_audio_for_split = False
-                dataset_records = processed_records
+                    processed_records.append(new_record)
             else:
-                include_audio_for_split = True
-                dataset_records = records_with_audio
+                processed_records.append(new_record)
+
+        # Pad audio arrays to the max length
+        if include_audio and audio_data_list:
+            print(f"Padding audio arrays to a uniform length of {max_audio_length} samples.")
+            for record in audio_data_list:
+                audio_array = record['audio_array']
+                padded_array = np.pad(audio_array, (0, max_audio_length - len(audio_array)), 'constant')
+                record['audio'] = {
+                    'array': padded_array,
+                    'sampling_rate': record['audio_sample_rate']
+                }
+                del record['audio_array']
+                del record['audio_sample_rate']
+                processed_records.append(record)
+
+        # Remove records without audio if specified
+        if include_audio and original_audio_data:
+            dataset_records = [r for r in processed_records if 'audio' in r]
+            if not dataset_records:
+                print(f"No records with audio in {split_name}, creating dataset without audio.")
+                include_audio = False
+                dataset_records = processed_records
         else:
-            include_audio_for_split = False
+            include_audio = False  # No audio data available
             dataset_records = processed_records
 
         print(f"Creating dataset for {split_name} from {len(dataset_records)} records")
 
-        # Define the features schema explicitly
-        if include_audio_for_split:
+        # Define the features schema
+        if include_audio:
             features = Features({
-                'chunk_id': Value('string'),
+                'filename': Value('string'),
                 'text': Value('string'),
-                'source_sample_id': Value('string'),
-                'chunk_index': Value('int64'),
+                'source_file': Value('string'),
                 'start': Value('float64'),
                 'end': Value('float64'),
-                'duration': Value('float64'),
-                'word_count': Value('int64'),
                 'asr_transcription': Value('string'),
                 'match_score': Value('int64'),
-                'dataset_name': Value('string'),
-                'split': Value('string'),
                 'audio': Audio(sampling_rate=16000)
             })
         else:
             features = Features({
-                'chunk_id': Value('string'),
+                'filename': Value('string'),
                 'text': Value('string'),
-                'source_sample_id': Value('string'),
-                'chunk_index': Value('int64'),
+                'source_file': Value('string'),
                 'start': Value('float64'),
                 'end': Value('float64'),
-                'duration': Value('float64'),
-                'word_count': Value('int64'),
                 'asr_transcription': Value('string'),
-                'match_score': Value('int64'),
-                'dataset_name': Value('string'),
-                'split': Value('string')
+                'match_score': Value('int64')
             })
 
-        # Create dataset with explicit features
         try:
             dataset = Dataset.from_list(dataset_records, features=features)
-            print(f"Dataset for {split_name} created successfully with explicit features")
+            print(f"Dataset for {split_name} created successfully.")
         except Exception as e:
-            print(f"Error creating dataset for {split_name} with features: {e}")
-
-            # Try to fix the data format
-            print(f"Attempting to fix audio data format for {split_name}...")
-
-            # Double-check all audio data is properly formatted
-            for i, record in enumerate(dataset_records):
-                if 'audio' in record:
-                    audio_data = record['audio']
-                    if isinstance(audio_data['array'], list):
-                        print(f"Converting list to numpy array for record {i} in {split_name}")
-                        audio_data['array'] = np.array(audio_data['array'], dtype=np.float32)
-                    elif not isinstance(audio_data['array'], np.ndarray):
-                        print(f"Converting {type(audio_data['array'])} to numpy array for record {i} in {split_name}")
-                        audio_data['array'] = np.array(audio_data['array'], dtype=np.float32)
-
-                    # Ensure it's 1D
-                    if audio_data['array'].ndim > 1:
-                        audio_data['array'] = audio_data['array'].flatten()
-
-                    # Ensure correct dtype
-                    if audio_data['array'].dtype != np.float32:
-                        audio_data['array'] = audio_data['array'].astype(np.float32)
-
-            # Try again with corrected data
-            try:
-                dataset = Dataset.from_list(dataset_records, features=features)
-                print(f"Dataset for {split_name} created successfully after fixing audio format")
-            except Exception as e2:
-                print(f"Still failing for {split_name} after audio format fix: {e2}")
-                # Final fallback: create dataset without audio and warn user
-                records_without_audio = []
-                for record in dataset_records:
-                    new_record = {k: v for k, v in record.items() if k != 'audio'}
-                    records_without_audio.append(new_record)
-
-                features_no_audio = Features({k: v for k, v in features.items() if k != 'audio'})
-                dataset = Dataset.from_list(records_without_audio, features=features_no_audio)
-                print(f"WARNING: Created dataset for {split_name} WITHOUT audio due to formatting issues")
+            print(f"Final dataset creation failed for {split_name}: {e}")
+            continue
 
         datasets_by_split[split_name] = dataset
 
-    # Create DatasetDict with all splits
+    if not datasets_by_split:
+        return "No datasets were created."
+        
     dataset_dict = DatasetDict(datasets_by_split)
 
-    # If no name provided, use a default name
     if not output_dataset_name:
         output_dataset_name = "forced_alignment_results"
 
-    # Save the dataset with splits
     print(f"Pushing dataset '{output_dataset_name}' with {len(datasets_by_split)} splits to HuggingFace Hub")
     dataset_dict.push_to_hub(output_dataset_name, token=token, private=True)
 
@@ -348,12 +280,12 @@ def align_from_dataset_parallel(
             waveform, sr = audioarray_to_waveform(audio_array, sample_rate)
 
             original_audio_data[sample_id] = {
-                'waveform': waveform,
+                'waveform': waveform.cpu().numpy().tolist(),  # Convert to list for serialization
                 'sample_rate': sr
             }
 
             sample_dicts.append({
-                "waveform": audio_array,
+                "waveform": audio_array.tolist() if hasattr(audio_array, 'tolist') else audio_array,  # Convert numpy to list
                 "sr": sample_rate,
                 "text": texts[idx],
                 "id": sample_id,
@@ -389,7 +321,7 @@ def align_from_dataset_parallel(
     if output_dataset_name:
         push_to_hf_dataset.remote(all_output_records, output_dataset_name,
                                 token=os.getenv("HF_TOKEN"),
-                                original_audio_data=original_audio_data)
+                                original_audio_data=None)  # Skip audio for now to avoid serialization issues
 
     return all_output_records
 
@@ -464,7 +396,7 @@ def align_from_s3_parallel(
                     sr = 16000
 
                 original_audio_data[filename] = {
-                    'waveform': waveform,
+                    'waveform': waveform.cpu().numpy().tolist(),  # Convert to list for serialization
                     'sample_rate': sr
                 }
             except Exception as e:
@@ -484,7 +416,7 @@ def align_from_s3_parallel(
     if output_dataset_name:
         push_to_hf_dataset.remote(all_output_records, output_dataset_name,
                                 token=os.getenv("HF_TOKEN"),
-                                original_audio_data=original_audio_data)
+                                original_audio_data=None)  # Skip audio for now to avoid serialization issues
 
     return all_output_records
 
@@ -950,7 +882,9 @@ def process_single_dataset_sample(
 
     print(f"Sample ID: {sample_id}, Text chunks: {len(text_chunks)}")
 
-    waveform = sample_dict["waveform"]  # np.ndarray
+    waveform = sample_dict["waveform"]  # List or np.ndarray
+    if isinstance(waveform, list):
+        waveform = np.array(waveform)  # Convert back from list
     sr       = sample_dict["sr"]        # int
     text     = sample_dict["text"]
     sample_id= sample_dict.get("id") or f"{split}_sample_{sample_dict['idx']}"
