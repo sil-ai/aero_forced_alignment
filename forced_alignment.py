@@ -478,7 +478,11 @@ def process_single_s3_file(file_data: Dict[str, Union[str, List[Dict[str, str]]]
         else:
             text_refs = [filename + '_' + str(i) for i in range(len(text_lines))]
         
-        chunk_text = '|' + '|'.join(text_lines).upper() + '|'
+        # Use lowercase for MMS models, uppercase for English models
+        if mms_lang:
+            chunk_text = '|' + '|'.join(text_lines).lower() + '|'
+        else:
+            chunk_text = '|' + '|'.join(text_lines).upper() + '|'
 
         if romanize:
             uroman = ur.Uroman()
@@ -659,23 +663,51 @@ def process_audio_and_align(waveform, transcript_text, mms_lang=None, romanize=F
     import gc
     from transformers import Wav2Vec2ForCTC, Wav2Vec2Processor
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    
     # Select model based on language
     if mms_lang:
-        model_name = MMS_MODEL
         print(f"Using MMS model for language: {mms_lang}")
+        try:
+            # Try loading with target_lang parameter first (like the working implementation)
+            from transformers import AutoProcessor
+            model = Wav2Vec2ForCTC.from_pretrained(
+                MMS_MODEL, 
+                target_lang=mms_lang, 
+                ignore_mismatched_sizes=True,
+                cache_dir=CACHE_DIR
+            ).to(device)
+            processor = AutoProcessor.from_pretrained(
+                MMS_MODEL, 
+                target_lang=mms_lang,
+                cache_dir=CACHE_DIR
+            )
+            print(f"Successfully loaded MMS model with target_lang: {mms_lang}")
+        except Exception as e:
+            print(f"Failed to load MMS model with target_lang={mms_lang}: {e}")
+            print("Falling back to loading without target_lang and then loading adapter...")
+            # Fallback approach: load base model first, then load adapter
+            model = Wav2Vec2ForCTC.from_pretrained(
+                MMS_MODEL,
+                ignore_mismatched_sizes=True,
+                cache_dir=CACHE_DIR
+            ).to(device)
+            processor = AutoProcessor.from_pretrained(
+                MMS_MODEL,
+                cache_dir=CACHE_DIR
+            )
+            # Load the specific language adapter
+            try:
+                model.load_adapter(mms_lang)
+                processor.set_target_lang(mms_lang)
+                print(f"Successfully loaded adapter for: {mms_lang}")
+            except Exception as adapter_e:
+                print(f"Failed to load adapter for {mms_lang}: {adapter_e}")
+                print("Continuing with base model...")
     else:
-        model_name = DEFAULT_MODEL
         print("Using default English model")
-    
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    processor = Wav2Vec2Processor.from_pretrained(model_name, cache_dir=CACHE_DIR)
-    model = Wav2Vec2ForCTC.from_pretrained(model_name, cache_dir=CACHE_DIR).to(device)
-    
-    # Set target language for MMS model
-    if mms_lang and hasattr(processor.tokenizer, 'set_target_lang'):
-        processor.tokenizer.set_target_lang(mms_lang)
-        model.load_adapter(mms_lang)
-        print(f"Set MMS target language to: {mms_lang}")
+        model = Wav2Vec2ForCTC.from_pretrained(DEFAULT_MODEL, cache_dir=CACHE_DIR).to(device)
+        processor = Wav2Vec2Processor.from_pretrained(DEFAULT_MODEL, cache_dir=CACHE_DIR)
     
     labels = processor.tokenizer.convert_ids_to_tokens(list(range(model.lm_head.out_features)))
     label_dict = {c: i for i, c in enumerate(labels)}
@@ -685,8 +717,28 @@ def process_audio_and_align(waveform, transcript_text, mms_lang=None, romanize=F
     transcript_tokens = list(transcript_text.strip().replace("\n", "|"))
 
     token_ids = [label_dict[p] for p in transcript_tokens if p in label_dict]
-    if not token_ids:
+    
+    missing_chars = set()
+    valid_chars = set()
+    for char in transcript_tokens:
+        if char in label_dict:
+            valid_chars.add(char)
+        else:
+            missing_chars.add(char)
+    
+    if missing_chars:
+        print(f"DEBUG: Missing characters (first 20): {sorted(list(missing_chars))[:20]}")
+    
+    # Filter transcript to only include valid characters
+    filtered_tokens = [char for char in transcript_tokens if char in label_dict]
+    filtered_token_ids = [label_dict[char] for char in filtered_tokens]
+    
+    if not filtered_token_ids:
         raise ValueError("None of the tokens in transcript were found in the model label set.")
+    
+    # Use filtered tokens for alignment
+    token_ids = filtered_token_ids
+    transcript_tokens = filtered_tokens
 
     try:
         input_values = processor(waveform, sampling_rate=16000, return_tensors="pt").input_values.to(device)
@@ -798,13 +850,25 @@ def extract_asr_segments(emissions, break_segs, ratio, mms_lang=None, romanize=F
     import uroman as ur
     from transformers import Wav2Vec2Processor
 
-    # Use appropriate model
-    model_name = MMS_MODEL if mms_lang else DEFAULT_MODEL
-    processor = Wav2Vec2Processor.from_pretrained(model_name, cache_dir=CACHE_DIR)
-    
-    # Set target language for MMS
-    if mms_lang and hasattr(processor.tokenizer, 'set_target_lang'):
-        processor.tokenizer.set_target_lang(mms_lang)
+    # Use appropriate model with proper MMS setup
+    if mms_lang:
+        try:
+            from transformers import AutoProcessor
+            processor = AutoProcessor.from_pretrained(
+                MMS_MODEL, 
+                target_lang=mms_lang,
+                cache_dir=CACHE_DIR
+            )
+        except Exception as e:
+            print(f"Warning: Failed to load MMS processor with target_lang, using fallback: {e}")
+            processor = AutoProcessor.from_pretrained(MMS_MODEL, cache_dir=CACHE_DIR)
+            try:
+                processor.set_target_lang(mms_lang)
+            except Exception:
+                pass
+    else:
+        from transformers import Wav2Vec2Processor
+        processor = Wav2Vec2Processor.from_pretrained(DEFAULT_MODEL, cache_dir=CACHE_DIR)
     
     asr_segments = []
 
@@ -893,7 +957,11 @@ def process_single_dataset_sample(
     print(f"Processing sample {idx} ({sample_id}) with {len(text_chunks)} text chunks")
 
     # Create combined text for alignment
-    chunk_text = '|' + '|'.join(text_chunks).upper() + '|'
+    # Use lowercase for MMS models, uppercase for English models
+    if mms_lang:
+        chunk_text = '|' + '|'.join(text_chunks).lower() + '|'
+    else:
+        chunk_text = '|' + '|'.join(text_chunks).upper() + '|'
 
     if romanize:
         uroman = ur.Uroman()
@@ -914,7 +982,7 @@ def process_single_dataset_sample(
     break_segs, trellis, emissions = process_audio_and_align.remote(waveform, text_block, mms_lang, romanize)
 
     ratio = waveform.size(1) / trellis.size(0)
-    
+
     # Extract ASR segments
     asr_segments = extract_asr_segments(emissions, break_segs, ratio, mms_lang, romanize)
 
@@ -944,12 +1012,11 @@ def process_single_dataset_sample(
                 text_for_comparison = uroman.romanize_string(text_chunks[i], lcode=mms_lang if mms_lang else None).lower()
             match_score = fuzz.ratio(text_for_comparison, asr_transcription)
 
-            # Append record
+            # Append record with consistent field names for dataset creation
             output_records.append({
-                'chunk_id': chunk_id,
+                'filename': chunk_id,  # Use chunk_id as filename for dataset
                 'text': text_chunks[i],
-                'source_sample_id': sample_id,
-                'chunk_index': i,
+                'source_file': sample_id,  # Use sample_id as source_file
                 'start': x0_seconds,
                 'end': x1_seconds,
                 'duration': round(x1_seconds - x0_seconds, 3),
@@ -958,6 +1025,10 @@ def process_single_dataset_sample(
                 'match_score': match_score,
                 'dataset_name': dataset_name,
                 'split': split,
+                # Keep the original fields for compatibility
+                'chunk_id': chunk_id,
+                'source_sample_id': sample_id,
+                'chunk_index': i,
             })
             prev_x1_seconds = x1_seconds
 
