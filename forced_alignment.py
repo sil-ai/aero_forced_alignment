@@ -512,28 +512,28 @@ def process_single_s3_file(file_data: Dict[str, Union[str, List[Dict[str, str]]]
             sr = 16000
 
         # Perform alignment with appropriate model
-        break_segs, trellis, emissions = process_audio_and_align.remote(
+        break_segs, break_segs_m1, trellis, emissions = process_audio_and_align.remote(
             waveform, text_block, mms_lang, romanize
         )
         ratio = waveform.size(1) / trellis.size(0)
 
         # Extract ASR segments
-        asr_segments = extract_asr_segments(emissions, break_segs, ratio, mms_lang, romanize)
-
-        prev_x1_seconds = 0
+        asr_segments, midpoints = extract_asr_segments(emissions, break_segs, break_segs_m1, ratio, mms_lang, romanize)
+        
         for i in range(len(break_segs)-1):
-            output_filename = text_refs[i].replace(' ', '_').replace(':', '_').replace('\n', '')
-            output_key = f'output/{output_filename}.wav'
-            x0_frames = int(ratio * break_segs[i].end)
-            if i + 1 < len(break_segs):
-                x1_frames = int(ratio * break_segs[i+1].start)
+            
+            output_filename = text_refs[i].replace(' ', '').replace(':', '_').replace('\n', '')
+            output_key = output_filename
+
+            if i == 0:
+                x0_frames = max(0, midpoints[i] - int(0.2 * sr))
             else:
-                x1_frames = waveform.size(1)
+                x0_frames = midpoints[i]
+
+            x1_frames = midpoints[i + 1]
+
             x0_seconds = round(x0_frames / sr, 3)
             x1_seconds = round(x1_frames / sr, 3)
-            x0_seconds = x0_seconds - 0.1
-            if x0_seconds < prev_x1_seconds:
-                x0_seconds = prev_x1_seconds
             
             # Use the corresponding ASR segment
             asr_transcription = asr_segments[i].lower() if i < len(asr_segments) else ""
@@ -553,7 +553,6 @@ def process_single_s3_file(file_data: Dict[str, Union[str, List[Dict[str, str]]]
                 'asr_transcription': asr_transcription,
                 'match_score': match_score
             })
-            prev_x1_seconds = x1_seconds
 
         print(f"Processed file: {filename}, created {len(output_records)} segments")
 
@@ -751,10 +750,12 @@ def process_audio_and_align(waveform, transcript_text, mms_lang=None, romanize=F
         segments = merge_repeats(path, transcript_tokens)
         print("Segments: " + str(segments[:5]))
         break_segs = [seg for seg in segments if seg.label == "|"]
+        # Get segments right before breaks 
+        break_segs_m1 = [segments[i-1] for i in range(1, len(segments)) if segments[i].label == "|"]
         trellis = trellis.cpu()
         emissions = emissions.cpu()
 
-        return break_segs, trellis, emissions
+        return break_segs, break_segs_m1, trellis, emissions
 
     finally:
         # Clean up GPU memory
@@ -844,7 +845,7 @@ def merge_repeats(path, transcript):
     return segments
 
 
-def extract_asr_segments(emissions, break_segs, ratio, mms_lang=None, romanize=False):
+def extract_asr_segments(emissions, break_segs, break_segs_m1, ratio, mms_lang=None, romanize=False):
     """Extract ASR transcriptions for each segment with optional MMS language support."""
     import torch
     import uroman as ur
@@ -871,6 +872,7 @@ def extract_asr_segments(emissions, break_segs, ratio, mms_lang=None, romanize=F
         processor = Wav2Vec2Processor.from_pretrained(DEFAULT_MODEL, cache_dir=CACHE_DIR)
     
     asr_segments = []
+    midpoints = [int(ratio * break_segs[0].end)]
 
     for i in range(len(break_segs) - 1):
         # Calculate frame boundaries for this segment
@@ -879,6 +881,10 @@ def extract_asr_segments(emissions, break_segs, ratio, mms_lang=None, romanize=F
             end_frame = int(ratio * break_segs[i + 1].start)
         else:
             end_frame = emissions.size(0) * ratio
+        
+        mid_frame = (int(ratio * break_segs_m1[i].start) + int(ratio * break_segs_m1[i].end)) // 2
+
+        midpoints += [mid_frame]
 
         # Convert to emission frame indices
         start_emission_frame = int(start_frame / ratio)
@@ -904,7 +910,7 @@ def extract_asr_segments(emissions, break_segs, ratio, mms_lang=None, romanize=F
         uroman = ur.Uroman()
         asr_segments = [uroman.romanize_string(text, lcode=mms_lang if mms_lang else None) for text in asr_segments]
 
-    return asr_segments
+    return asr_segments, midpoints
 
 
 @app.function(timeout=600)
@@ -979,29 +985,27 @@ def process_single_dataset_sample(
         return output_records
 
     # Perform alignment
-    break_segs, trellis, emissions = process_audio_and_align.remote(waveform, text_block, mms_lang, romanize)
+    break_segs, break_segs_m1, trellis, emissions = process_audio_and_align.remote(waveform, text_block, mms_lang, romanize)
 
     ratio = waveform.size(1) / trellis.size(0)
 
     # Extract ASR segments
-    asr_segments = extract_asr_segments(emissions, break_segs, ratio, mms_lang, romanize)
+    asr_segments, midpoints = extract_asr_segments(emissions, break_segs, break_segs_m1, ratio, mms_lang, romanize)
 
     # Create output records for each chunk
-    prev_x1_seconds = 0
     for i in range(len(break_segs) - 1):
         if i < len(text_chunks):
             chunk_id = f"{sample_id}_chunk_{i}"
-            x0_frames = int(ratio * break_segs[i].end)
-            if i + 1 < len(break_segs):
-                x1_frames = int(ratio * break_segs[i + 1].start)
-            else:
-                x1_frames = waveform.size(1)
 
-            x0_seconds = round(x0_frames / sr, 3)
-            x1_seconds = round(x1_frames / sr, 3)
-            x0_seconds = x0_seconds - 0.1
-            if x0_seconds < prev_x1_seconds:
-                x0_seconds = prev_x1_seconds
+            output_filename = text_refs[i].replace(' ', '').replace(':', '_').replace('\n', '')
+            output_key = output_filename
+
+            if i == 0:
+                x0_frames = max(0, midpoints[i] - int(0.2 * sr))
+            else:
+                x0_frames = midpoints[i]
+
+            x1_frames = midpoints[i + 1]
 
             # Use the corresponding ASR segment
             asr_transcription = asr_segments[i].lower() if i < len(asr_segments) else ""
@@ -1030,7 +1034,6 @@ def process_single_dataset_sample(
                 'source_sample_id': sample_id,
                 'chunk_index': i,
             })
-            prev_x1_seconds = x1_seconds
 
     print(f"Processed {split} sample {idx}: {sample_id}, created {len(text_chunks)} chunks")
 
